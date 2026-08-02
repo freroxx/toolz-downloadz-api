@@ -203,6 +203,58 @@ def _extract_youtube(strategies: List[List[str]], url: str, ydl_opts: Dict[str, 
     raise RuntimeError(last_error)
 
 
+def extract_youtube_pytubefix(url: str) -> Optional[dict]:
+    """Fallback engine for YouTube using pytubefix (a different extractor stack)."""
+    try:
+        from pytubefix import YouTube
+    except Exception:
+        return None
+
+    try:
+        yt = YouTube(url)
+        video_streams = []
+        audio_streams = []
+        for s in yt.streams:
+            if not s.url:
+                continue
+            fmt = {
+                'format_id': s.itag,
+                'ext': s.mime_type.split('/')[-1] if s.mime_type else 'mp4',
+                'resolution': s.resolution or s.abr or 'audio',
+                'url': s.url,
+                'filesize': s.filesize,
+                'vcodec': 'none' if not s.resolution else 'avc1.64001f',
+                'acodec': 'mp4a.40.2' if s.abr else None,
+            }
+            if s.abr or not s.resolution:
+                audio_streams.append(fmt)
+            else:
+                video_streams.append(fmt)
+
+        download_url = None
+        for s in yt.streams.filter(progressive=True, file_extension='mp4'):
+            download_url = s.url
+            break
+
+        return {
+            "platform": "youtube",
+            "title": yt.title,
+            "thumbnail": yt.thumbnail_url,
+            "duration": getattr(yt, 'length', None),
+            "uploader": yt.author,
+            "uploader_url": None,
+            "stats": {"views": None, "likes": None, "comments": None,
+                      "reposts": None, "creator_followers": None},
+            "upload_date": None,
+            "download_url": download_url,
+            "ext": 'mp4',
+            "blocked": False,
+            "formats": {"video": video_streams, "audio": audio_streams},
+        }
+    except Exception:
+        return None
+
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "online", "service": "toolz-downloadz-api", "version": "1.2.0"}
@@ -217,20 +269,31 @@ async def extract_media(url: str):
     platform = detect_platform(url)
 
     if platform == 'youtube':
-        # Try yt-dlp with client rotation; on repeat blocks pivot to oEmbed metadata.
+        # Engine 1: yt-dlp with multi-client rotation.
         try:
             info = _extract_youtube(YOUTUBE_CLIENT_STRATEGIES, url, build_ydl_opts('youtube'))
             return build_response(platform, info)
         except Exception:
-            meta = youtube_oembed(url)
-            if meta:
-                return blocked_response(meta)
-            raise HTTPException(
-                status_code=400,
-                detail=("Extraction failed: YouTube rejected the request from this server. "
-                        "This is usually a temporary IP reputation block. Reinstall/update "
-                        "the API cookie env or try again shortly.")
-            )
+            pass
+
+        # Engine 2: pytubefix (independent extractor stack, may slip through).
+        try:
+            info = extract_youtube_pytubefix(url)
+            if info:
+                return info
+        except Exception:
+            pass
+
+        # Engine 3: never-blocked public metadata + clear guidance.
+        meta = youtube_oembed(url)
+        if meta:
+            return blocked_response(meta)
+        raise HTTPException(
+            status_code=400,
+            detail=("Extraction failed: YouTube rejected the request from this server. "
+                    "This is a temporary IP reputation block; configure YOUTUBE_COOKIES "
+                    "or self-host (see README) to restore access.")
+        )
 
     try:
         ydl_opts = build_ydl_opts(platform)
