@@ -89,15 +89,21 @@ async def extract_media(url: str):
         'nocheckcertificate': True,
         'ignoreerrors': False,
         'logtostderr': False,
-        'socket_timeout': 10,
+        'socket_timeout': 7,
+        'geo_bypass': True,
+        'check_formats': False,
         # Bypassing datacenter IP blocks with specific client emulation
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv', 'mweb', 'android']
+                'player_client': ['tv', 'mweb', 'android'],
+                'player_skip': ['webpage', 'configs']
+            },
+            'instagram': {
+                'get_comments': False
             }
         },
         # User agent to mimic a real browser
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     }
 
     try:
@@ -174,9 +180,14 @@ async def extract_media(url: str):
 
     except Exception as e:
         # Catch and return yt-dlp errors gracefully
+        # Strip potential HTML from error messages to avoid client parsing issues
+        error_msg = str(e)
+        if "<!DOCTYPE" in error_msg or "<html" in error_msg.lower():
+            error_msg = "Platform blocked the request or returned an invalid response. Try again later."
+
         raise HTTPException(
             status_code=400,
-            detail=f"Extraction failed: {str(e)}"
+            detail=f"Extraction failed: {error_msg}"
         )
 
 if __name__ == "__main__":
