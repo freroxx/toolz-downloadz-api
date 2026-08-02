@@ -69,7 +69,7 @@ async def health_check():
     return {
         "status": "online",
         "service": "toolz-downloadz-api",
-        "version": "1.1.0"
+        "version": "1.1.1"
     }
 
 @app.get("/api/extract", dependencies=[Depends(verify_api_key)])
@@ -92,10 +92,12 @@ async def extract_media(url: str):
         'socket_timeout': 7,
         'geo_bypass': True,
         'check_formats': False,
+        'youtube_include_dash_manifest': False,
+        'youtube_include_hls_manifest': False,
         # Bypassing datacenter IP blocks with specific client emulation
         'extractor_args': {
             'youtube': {
-                'player_client': ['tv', 'mweb', 'android'],
+                'player_client': ['ios', 'android', 'mweb'],
                 'player_skip': ['webpage', 'configs']
             },
             'instagram': {
@@ -182,7 +184,9 @@ async def extract_media(url: str):
         # Catch and return yt-dlp errors gracefully
         # Strip potential HTML from error messages to avoid client parsing issues
         error_msg = str(e)
-        if "<!DOCTYPE" in error_msg or "<html" in error_msg.lower():
+        if "confirm you're not a bot" in error_msg.lower():
+            error_msg = "YouTube detected bot-like behavior. This is common on serverless hosting. Try again in a few minutes or use a different URL."
+        elif "<!DOCTYPE" in error_msg or "<html" in error_msg.lower():
             error_msg = "Platform blocked the request or returned an invalid response. Try again later."
 
         raise HTTPException(
