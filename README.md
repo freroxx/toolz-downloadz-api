@@ -35,7 +35,7 @@ Lightweight, production-ready FastAPI backend optimized for Vercel Serverless. P
 3. **Configure Environment Variables:**
    Copy `.env.example` to `.env` and set your secret key:
    ```bash
-   cp .env.example .env
+   cp .env .env
    ```
 
 4. **Run the development server:**
