@@ -5,3 +5,5 @@ pytubefix>=1.0.0
 curl_cffi>=0.7.2
 brotli>=1.1.0
 python-dotenv>=1.0.1
+# Proof-of-Origin token provider plugin; active when YT_DLP_POT_PROVIDER_URL is set.
+bgutil-ytdlp-pot-provider>=1.3.1

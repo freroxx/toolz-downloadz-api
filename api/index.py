@@ -119,20 +119,33 @@ def build_ydl_opts(platform: str, youtube_clients: Optional[List[str]] = None) -
     if cookie_file:
         opts['cookiefile'] = cookie_file
 
+    # PO Token provider (bgutil). Enables real YouTube bypass on flagged IPs
+    # when a token server is available. The plugin (bgutil-ytdlp-pot-provider)
+    # auto-detects a server on http://127.0.0.1:4416; for a custom server URL
+    # point YT_DLP_POT_PROVIDER_URL at it and it is wired via extractor args.
+    pot_url = os.getenv('YT_DLP_POT_PROVIDER_URL') or os.getenv('POT_PROVIDER_URL')
+    if pot_url:
+        opts['extractor_args']['youtubepot-bgutilhttp'] = {'base_url': pot_url}
+
     if platform == 'youtube':
         opts['format'] = 'best[ext=mp4]/best'
         opts['youtube_include_dash_manifest'] = False
         opts['youtube_include_hls_manifest'] = False
-        opts['extractor_args']['youtube'] = {
-            'player_client': youtube_clients or ['android', 'mweb', 'web_safari'],
-            'player_skip': ['webpage', 'configs'],
-        }
+        opts['extractor_args'].setdefault('youtube', {})
+        if not pot_url:
+            opts['extractor_args']['youtube'].setdefault('player_client',
+                                                         youtube_clients or ['android', 'mweb', 'web_safari'])
+        opts['extractor_args']['youtube'].setdefault('player_skip', ['webpage', 'configs'])
 
     elif platform == 'instagram':
         opts['extractor_args']['instagram'] = {'get_comments': False}
 
     elif platform == 'tiktok':
-        opts['extractor_args']['tiktok'] = {'api_hostname': 'api22-normal-c-useast2a.tiktok.com'}
+        # More tolerant API host selection plus web client implies via headers.
+        opts['extractor_args']['tiktok'] = {
+            'api_hostname': 'api16-normal-useast5.us.tiktok.com',
+            'web_instance_url': 'https://www.tiktok.com/',
+        }
 
     elif platform == 'twitter':
         opts['extractor_args']['twitter'] = {'mobile_redirect': True}
@@ -188,13 +201,14 @@ def normalize_streams(info: dict) -> Tuple[List[dict], List[dict]]:
 
 def _extract_youtube(strategies: List[List[str]], url: str, ydl_opts: Dict[str, Any]) -> dict:
     last_error = "YouTube extraction failed"
+    base_youtube_args = dict(ydl_opts['extractor_args'].get('youtube') or {})
+    base_youtube_args.pop('player_client', None)
     for clients in strategies:
         opts = dict(ydl_opts)
         opts['extractor_args'] = dict(ydl_opts['extractor_args'])
-        opts['extractor_args']['youtube'] = {
-            'player_client': clients,
-            'player_skip': ['webpage', 'configs'],
-        }
+        youtube_args = dict(base_youtube_args)
+        youtube_args['player_client'] = clients
+        opts['extractor_args']['youtube'] = youtube_args
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -259,7 +273,7 @@ def extract_youtube_pytubefix(url: str) -> Optional[dict]:
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "online", "service": "toolz-downloadz-api", "version": "1.2.0"}
+    return {"status": "online", "service": "toolz-downloadz-api", "version": "1.3.0"}
 
 
 @app.get("/api/extract", dependencies=[Depends(verify_api_key)])

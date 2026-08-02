@@ -29,15 +29,36 @@ bot."* This API handles that with three layers:
 3. **Optional cookie auth** – set `YOUTUBE_COOKIES` (Netscape format exported
    from a browser) to authenticate and bypass the block entirely. Never keep
    using that browser session after exporting.
+4. **PO Token provider (strongest)** – run the
+   [bgutil POT provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+   (Docker image `brainicism/bgutil-ytdlp-pot-provider`, or Node/Deno) alongside
+   this app and set `YT_DLP_POT_PROVIDER_URL` to its URL. The plugin
+   (`bgutil-ytdlp-pot-provider`, pinned in `requirements.txt`) is auto-detected
+   on `http://127.0.0.1:4416`, but a custom `base_url` is passed through via
+   extractor args. Requires a Node/Deno-capable host (e.g. self-host), not
+   Vercel serverless.
 
 ### Self-hosting for maximum success
 
 Serverless datacenter IPs are the #1 trigger for bot blocks. For the most
-reliable behavior, run the same code on a persistent VPS/residential IP:
+reliable behavior, run the same code on a persistent VPS/residential IP, and if
+YouTube still blocks, add the POT provider:
 
 ```bash
 docker build -t toolz-downloadz-api .
 docker run --rm -p 8000:8000 -e API_SECRET_KEY=your_key toolz-downloadz-api
+```
+
+To run the PO-Origin token server alongside the API on one host:
+
+```bash
+docker run --name bgutil-provider -d --init \
+  brainicism/bgutil-ytdlp-pot-provider
+# provider listens on http://127.0.0.1:4416 by default — the plugin finds it
+# automatically, no env var needed. For a custom URL set:
+docker run --rm -p 8000:8000 \
+  -e API_SECRET_KEY=your_key \
+  -e YT_DLP_POT_PROVIDER_URL=http://127.0.0.1:4416 toolz-downloadz-api
 ```
 
 ## Setup & Local Development
