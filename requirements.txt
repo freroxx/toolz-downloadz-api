@@ -1,4 +1,6 @@
-fastapi
-uvicorn
-yt-dlp
-python-dotenv
+fastapi>=0.110.0
+uvicorn>=0.29.0
+yt-dlp>=2026.07.04
+curl_cffi>=0.7.2
+brotli>=1.1.0
+python-dotenv>=1.0.1

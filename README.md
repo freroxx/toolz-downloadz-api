@@ -9,8 +9,36 @@ Lightweight, production-ready FastAPI backend optimized for Vercel Serverless. P
 - **Serverless Ready**: Designed to run on Vercel Functions with zero disk writes.
 - **FastAPI**: High-performance Python backend with automatic OpenAPI documentation.
 - **Secure**: Protected by `X-API-KEY` header authentication.
-- **Bot-Resistant**: Configured to bypass datacenter IP blocks using TV/Mobile client signatures.
+- **Bot-Resistant**: Multi-client rotation for YouTube plus a never-blocked oEmbed
+  metadata fallback; optional cookie file support for datacenter IP blocks.
 - **CORS Enabled**: Ready for connection from Android apps, Web UIs, and CLI tools.
+
+## Platform Support & Resilience
+
+`yt-dlp` runs against a datacenter IP on hosting platforms, and YouTube (and
+sometimes Instagram/Reddit) will flag it with *"Sign in to confirm you're not a
+bot."* This API handles that with three layers:
+
+1. **Client rotation** – YouTube is tried with several player clients
+   (`android`, `mweb`, `web_safari`, `ios`, `web`, `tv`, `android_vr`) until one
+   succeeds.
+2. **oEmbed fallback** – if YouTube blocks the extractor, metadata (title,
+   thumbnail, uploader) is still returned from YouTube's public oEmbed endpoint,
+   which is never blocked. The client sees a `blocked: true` card with an
+   *Open on source* action instead of a hard failure.
+3. **Optional cookie auth** – set `YOUTUBE_COOKIES` (Netscape format exported
+   from a browser) to authenticate and bypass the block entirely. Never keep
+   using that browser session after exporting.
+
+### Self-hosting for maximum success
+
+Serverless datacenter IPs are the #1 trigger for bot blocks. For the most
+reliable behavior, run the same code on a persistent VPS/residential IP:
+
+```bash
+docker build -t toolz-downloadz-api .
+docker run --rm -p 8000:8000 -e API_SECRET_KEY=your_key toolz-downloadz-api
+```
 
 ## Setup & Local Development
 
