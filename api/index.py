@@ -6,8 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
 from dotenv import load_dotenv
 
-# Load environment variables from .env if present
+# Load environment variables
+# Try loading from current dir, then root project dir
 load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 app = FastAPI(
     title="toolz-downloadz-api",
@@ -69,7 +71,7 @@ async def health_check():
     return {
         "status": "online",
         "service": "toolz-downloadz-api",
-        "version": "1.1.1"
+        "version": "1.1.2"
     }
 
 @app.get("/api/extract", dependencies=[Depends(verify_api_key)])
