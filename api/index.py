@@ -1,5 +1,6 @@
 import os
-from typing import List, Optional
+import re
+from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import yt_dlp
@@ -11,7 +12,7 @@ load_dotenv()
 app = FastAPI(
     title="toolz-downloadz-api",
     description="Serverless media extraction API for the Toolz ecosystem",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # Enable CORS for all domains to support Android and Web clients
@@ -25,6 +26,24 @@ app.add_middleware(
 
 # Configuration from environment variables
 API_SECRET_KEY = os.getenv("API_SECRET_KEY")
+
+def detect_platform(url: str) -> str:
+    """
+    Analyzes the URL domain and returns a clean string indicator:
+    'youtube', 'tiktok', 'instagram', 'twitter', 'reddit', or 'generic'.
+    """
+    url = url.lower()
+    if any(domain in url for domain in ["youtube.com", "youtu.be"]):
+        return "youtube"
+    elif "tiktok.com" in url:
+        return "tiktok"
+    elif "instagram.com" in url:
+        return "instagram"
+    elif any(domain in url for domain in ["twitter.com", "x.com"]):
+        return "twitter"
+    elif "reddit.com" in url:
+        return "reddit"
+    return "generic"
 
 async def verify_api_key(x_api_key: Optional[str] = Header(None)):
     """
@@ -50,14 +69,14 @@ async def health_check():
     return {
         "status": "online",
         "service": "toolz-downloadz-api",
-        "version": "1.0.0"
+        "version": "1.1.0"
     }
 
 @app.get("/api/extract", dependencies=[Depends(verify_api_key)])
 async def extract_media(url: str):
     """
     Extracts media metadata and direct CDN URLs using yt-dlp.
-    Optimized for Vercel Serverless (no disk writes).
+    Optimized for Vercel Serverless (no disk writes, socket timeout).
     """
     # yt-dlp configuration optimized for serverless and bot-bypass
     ydl_opts = {
@@ -70,6 +89,7 @@ async def extract_media(url: str):
         'nocheckcertificate': True,
         'ignoreerrors': False,
         'logtostderr': False,
+        'socket_timeout': 10,
         # Bypassing datacenter IP blocks with specific client emulation
         'extractor_args': {
             'youtube': {
@@ -81,12 +101,14 @@ async def extract_media(url: str):
     }
 
     try:
+        platform = detect_platform(url)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # extract_info with download=False ensures no files are saved to disk
             info = ydl.extract_info(url, download=False)
 
-            # Filter and clean up formats for the response
-            formats_list = []
+            # Categorize and clean up formats for the response
+            video_streams = []
+            audio_streams = []
             raw_formats = info.get('formats', [])
 
             for f in raw_formats:
@@ -94,7 +116,7 @@ async def extract_media(url: str):
                 if not format_url:
                     continue
 
-                formats_list.append({
+                fmt_data = {
                     'format_id': f.get('format_id'),
                     'ext': f.get('ext'),
                     'resolution': f.get('resolution') or f.get('format_note') or 'unknown',
@@ -102,28 +124,52 @@ async def extract_media(url: str):
                     'filesize': f.get('filesize') or f.get('filesize_approx'),
                     'vcodec': f.get('vcodec'),
                     'acodec': f.get('acodec')
-                })
+                }
+
+                if f.get('vcodec') == 'none':
+                    audio_streams.append(fmt_data)
+                else:
+                    video_streams.append(fmt_data)
+
+            # Sort streams by filesize descending as a heuristic for quality
+            video_streams.sort(key=lambda x: (x.get('filesize') or 0), reverse=True)
+            audio_streams.sort(key=lambda x: (x.get('filesize') or 0), reverse=True)
+
+            # Extract stats with safe fallbacks
+            stats = {
+                "views": info.get('view_count'),
+                "likes": info.get('like_count'),
+                "comments": info.get('comment_count'),
+                "reposts": info.get('repost_count') or info.get('retweet_count'),
+                "creator_followers": info.get('channel_follower_count') or info.get('uploader_follower_count')
+            }
 
             # Robust fallback for download_url
-            # Sometimes info['url'] is missing for high-quality DASH streams
             download_url = info.get('url')
-            if not download_url and formats_list:
-                # Fallback to the best available progressive/merged URL
-                # Progressive formats usually have both vcodec and acodec != 'none'
-                valid_formats = [f for f in formats_list if f['vcodec'] != 'none' and f['acodec'] != 'none']
-                if valid_formats:
-                    download_url = valid_formats[-1]['url']
-                else:
-                    download_url = formats_list[-1]['url']
+            if not download_url:
+                # Fallback to the best available progressive/merged URL from video streams
+                valid_video = [f for f in video_streams if f['vcodec'] != 'none' and f['acodec'] != 'none']
+                if valid_video:
+                    download_url = valid_video[0]['url']
+                elif video_streams:
+                    download_url = video_streams[0]['url']
+                elif audio_streams:
+                    download_url = audio_streams[0]['url']
 
             return {
+                "platform": platform,
                 "title": info.get('title'),
                 "thumbnail": info.get('thumbnail'),
                 "duration": info.get('duration'),
                 "uploader": info.get('uploader'),
+                "uploader_url": info.get('uploader_url'),
+                "stats": stats,
                 "download_url": download_url,
                 "ext": info.get('ext'),
-                "formats": formats_list
+                "formats": {
+                    "video": video_streams,
+                    "audio": audio_streams
+                }
             }
 
     except Exception as e:
