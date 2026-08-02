@@ -290,6 +290,7 @@ def build_response(platform: str, info: dict) -> dict:
         "uploader": info.get('uploader'),
         "uploader_url": info.get('uploader_url'),
         "stats": stats,
+        "upload_date": info.get('upload_date'),
         "download_url": download_url,
         "ext": info.get('ext'),
         "blocked": False,
@@ -308,6 +309,7 @@ def blocked_response(meta: dict) -> dict:
         "stats": {"views": None, "likes": None, "comments": None,
                   "reposts": None, "creator_followers": None},
         "download_url": None,
+        "upload_date": None,
         "blocked": True,
         "blocked_message": (
             "YouTube is blocking automated access from this server's IP region right now. "
