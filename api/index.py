@@ -26,8 +26,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration from environment variables
-API_SECRET_KEY = os.getenv("API_SECRET_KEY")
+# Configuration will be read within the dependency to handle serverless env better
+def get_api_secret():
+    return os.getenv("API_SECRET_KEY")
 
 def detect_platform(url: str) -> str:
     """
@@ -53,13 +54,14 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)):
     Returns 401 Unauthorized if the key is incorrect.
     Returns 500 Internal Server Error if the key is not configured on the server.
     """
-    if not API_SECRET_KEY:
+    secret = get_api_secret()
+    if not secret:
         raise HTTPException(
             status_code=500,
-            detail="Server configuration error: API_SECRET_KEY is not set."
+            detail="Server configuration error: API_SECRET_KEY is not set in Vercel Environment Variables."
         )
 
-    if x_api_key != API_SECRET_KEY:
+    if x_api_key != secret:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized: Invalid or missing X-API-KEY header"
