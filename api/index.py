@@ -174,6 +174,7 @@ def normalize_streams(info: dict) -> Tuple[List[dict], List[dict]]:
             'filesize': f.get('filesize') or f.get('filesize_approx'),
             'vcodec': f.get('vcodec'),
             'acodec': f.get('acodec'),
+            'headers': dict(f.get('http_headers') or {}),
         }
         if f.get('vcodec') == 'none':
             audio_streams.append(fmt)
@@ -247,6 +248,7 @@ def extract_youtube_pytubefix(url: str) -> Optional[dict]:
                       "reposts": None, "creator_followers": None},
             "upload_date": None,
             "download_url": download_url,
+            "download_headers": {'User-Agent': 'com.google.android.youtube/19.09.37 WebKit', 'os_version': 'Android 13'},
             "ext": 'mp4',
             "blocked": False,
             "formats": {"video": video_streams, "audio": audio_streams},
@@ -327,15 +329,19 @@ def build_response(platform: str, info: dict) -> dict:
     video_streams, audio_streams = normalize_streams(info)
 
     download_url = info.get('url')
+    headers_for_best = dict(info.get('http_headers') or {})
     if not download_url:
         merged = [f for f in video_streams
                   if f['vcodec'] not in (None, 'none') and f['acodec'] not in (None, 'none')]
         if merged:
             download_url = merged[0]['url']
+            headers_for_best = dict(merged[0].get('headers') or {})
         elif video_streams:
             download_url = video_streams[0]['url']
+            headers_for_best = dict(video_streams[0].get('headers') or {})
         elif audio_streams:
             download_url = audio_streams[0]['url']
+            headers_for_best = dict(audio_streams[0].get('headers') or {})
 
     stats = {
         "views": info.get('view_count'),
@@ -355,6 +361,7 @@ def build_response(platform: str, info: dict) -> dict:
         "stats": stats,
         "upload_date": info.get('upload_date'),
         "download_url": download_url,
+        "download_headers": headers_for_best,
         "ext": info.get('ext'),
         "blocked": False,
         "formats": {"video": video_streams, "audio": audio_streams},
@@ -373,6 +380,7 @@ def blocked_response(meta: dict) -> dict:
                   "reposts": None, "creator_followers": None},
         "download_url": None,
         "upload_date": None,
+        "download_headers": {},
         "blocked": True,
         "blocked_message": (
             "YouTube is blocking automated access from this server's IP region right now. "
