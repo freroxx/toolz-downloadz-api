@@ -227,16 +227,19 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         cf = _cookies_file(YOUTUBE_COOKIES, "yt_cookies.txt")
         if cf:
             opts["cookiefile"] = cf
-        opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best[ext=mp4]/best")
-        opts["youtube_include_dash_manifest"] = False
-        opts["youtube_include_hls_manifest"] = False
         if POT_PROVIDER_URL:
-            # PO-token provider (bgutil) — the modern cookie-free YouTube bypass.
-            # Plugin (bgutil-ytdlp-pot-provider, in requirements.txt) calls it automatically;
-            # with POT active we let yt-dlp pick PO-capable clients (no forced rotation).
+            # PO-token provider (bgutil) — modern cookie-free YouTube bypass.
+            # POT responses are DASH-only (no combined streams), so select the
+            # merge-pair to validate; individual video/audio URLs are served
+            # separately by /api/download (UI already lists them apart).
+            opts["format"] = custom_format or ("bestaudio/best" if audio_only else "bestvideo*+bestaudio/best")
             opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": POT_PROVIDER_URL}
-        elif yt_clients:
-            opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
+        else:
+            opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best[ext=mp4]/best")
+            opts["youtube_include_dash_manifest"] = False
+            opts["youtube_include_hls_manifest"] = False
+            if yt_clients:
+                opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
     elif platform == "tiktok":
         # NOTE: no api_hostname override — defaults are what currently work
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
@@ -328,6 +331,14 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
     video, audio = normalize(info)
     dl = info.get("url")
     hdrs = dict(info.get("http_headers") or {})
+    dl_cookies = None
+    # Merge-selected (POT/DASH): requested_formats holds the pair — prefer VIDEO
+    if not dl and info.get("requested_formats"):
+        wanted = [f for f in info["requested_formats"] if f.get("vcodec") != "none"] or info["requested_formats"]
+        pick = wanted[0]
+        dl = pick.get("url")
+        hdrs = dict(pick.get("http_headers") or {})
+        dl_cookies = pick.get("cookies")
     if not dl:
         merged = [f for f in video if f["vcodec"] not in (None, "none") and f["acodec"] not in (None, "none")]
         pick = merged or video or audio
@@ -337,8 +348,7 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
              ("view_count", "like_count", "comment_count")}
     # Pair the chosen download_url with ITS OWN cookies (TikTok tt_chain_token
     # must match the ?tk= param inside that exact URL or CDN returns 403)
-    dl_cookies = None
-    if dl:
+    if dl and not dl_cookies:
         for f_ in info.get("formats") or []:
             if f_.get("url") == dl and f_.get("cookies"):
                 dl_cookies = f_["cookies"]
