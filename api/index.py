@@ -42,7 +42,7 @@ COOKIES_KV_KEY = "toolz:yt_cookies"
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.4.2"
+VERSION = "3.4.3"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -562,24 +562,25 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                     POT_PROVIDER_URL.rstrip("/") + "/ping", headers={"User-Agent": UA}), timeout=8)
             except Exception:
                 pass
-        # With POT: try default clients first, then ios/android which often
-        # expose progressive (A/V combined) streams even on DASH-only sessions.
-        attempts = [None, ["ios"], ["android"]] if POT_PROVIDER_URL else YT_CLIENT_STRATEGIES
-        for clients in attempts:
+        # Full rotation ALWAYS — tv-family first (least bot-walled), plugin
+        # mints per-client PO tokens when POT is configured.
+        strategy_errors: Dict[str, str] = {}
+        for clients in YT_CLIENT_STRATEGIES:
+            label = "+".join(clients) if clients else "defaults"
             try:
                 return shape(platform, run_ydl(ydl_opts("youtube", audio_only, custom_format, clients), url), url)
             except Exception as e:
                 last = str(e)
-                if "Sign in to confirm" in last or "not a bot" in last:
-                    break  # IP-flagged; rotating clients won't help
-                if clients is None:  # last strategy tried
-                    break
+                strategy_errors[label] = last[:120]
+                # Try every strategy — tv-family often passes where web was walled.
+                continue
         alt = youtube_pytubefix(url)
         if alt:
             return alt
         meta = youtube_oembed(url)
         if meta:
-            diag = (last or "unknown")[:180]
+            strat = " | ".join(f"{k}:{v.split(':')[0][:48]}" for k, v in list(strategy_errors.items())[:4])
+            diag = f"{(last or 'unknown')[:120]} [{strat}]"
             return blocked_shape(
                 "youtube", meta, url,
                 BLOCK_MSGS["youtube"] + (
@@ -709,6 +710,35 @@ def _pot_status() -> Dict[str, Any]:
         out["get_pot_error"] = str(e)[:250]
         out["mint_ok"] = False
     return out
+
+
+@app.get("/api/ytdebug")
+async def ytdebug(request: Request, url: str = Query(...)):
+    """Run every YouTube strategy and return the per-client error map."""
+    check_auth(request)
+    clean = clean_url(url)
+    if detect_platform(clean) != "youtube":
+        raise HTTPException(status_code=400, detail="Not a YouTube URL")
+    results = []
+    for clients in YT_CLIENT_STRATEGIES:
+        label = "+".join(clients) if clients else "defaults"
+        try:
+            info = run_ydl(ydl_opts("youtube", False, None, clients), clean)
+            fmts = len((info or {}).get("formats") or [])
+            results.append({"strategy": label, "ok": True, "formats": fmts})
+        except Exception as e:
+            msg = str(e).replace("ERROR: ", "")[:160]
+            results.append({"strategy": label, "ok": False,
+                            "bot_block": ("Sign in to confirm" in str(e)) or ("not a bot" in str(e)),
+                            "error": msg})
+    pyt = youtube_pytubefix(clean)
+    results.append({"strategy": "pytubefix", "ok": bool(pyt),
+                    "note": None if pyt else "no streams"})
+    pot = _pot_status()
+    ck = get_youtube_cookies()
+    return {"url": clean, "results": results,
+            "pot": {"configured": bool(POT_PROVIDER_URL), **{k: pot.get(k) for k in ("ping_ms", "mint_ok", "get_pot_error", "warning") if k in pot}},
+            "cookies": {k: v for k, v in ck.items() if k != "content"}}
 
 
 @app.get("/api/potcheck")
