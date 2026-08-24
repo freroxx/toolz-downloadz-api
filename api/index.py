@@ -68,10 +68,10 @@ def _pot_plugin_installed() -> bool:
     """The bgutil yt-dlp plugin MUST be importable or tokens are never minted."""
     import importlib.util
     return importlib.util.find_spec("yt_dlp_plugins.extractor.getpot_bgutil_http") is not None
-EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
+EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "26"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.5.2"
+VERSION = "3.8.2"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -339,15 +339,19 @@ def youtube_loader(url: str, quality: str = "720", audio_only: bool = False) -> 
         if not job or not job.get("success") or not job.get("progress_url"):
             return None
         dl, title = None, None
-        for _ in range(7):  # ~15s inside EXTRACT_TIMEOUT budget
-            time.sleep(2.2)
+        time.sleep(3.5)  # jobs typically finish in 8-14s; skip early empty polls
+        for _ in range(7):  # ~15s polling window
             pr = _get_json(job["progress_url"], timeout=8)
+            if not pr:
+                time.sleep(2)
+                continue
             if not pr:
                 continue
             title = pr.get("title") or title
             if pr.get("download_url"):
                 dl = pr["download_url"]
                 break
+            time.sleep(2)
         if not dl:
             return None
     except Exception:
@@ -694,6 +698,15 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
     if platform == "youtube":
         ck_state = get_youtube_cookies()
         last = None
+
+        # STRATEGY 1 — loader.to rescue FIRST on serverless.
+        # Google deterministically bot-walls every yt-dlp strategy from Vercel
+        # datacenter IPs; loader extracts on THEIR IPs and hosts the MP4 on an
+        # IP-free CDN (~10-15s). Only when it's down do we burn time on yt-dlp.
+        alt = youtube_loader(url, audio_only=audio_only)
+        if alt:
+            return alt
+
         # Warm the POT provider (cold boot + BotGuard init can take 5-10s;
         # the plugin's own HTTP timeout is shorter than that). We're already
         # inside an executor thread here, so blocking is fine.
@@ -730,10 +743,6 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 strategy_errors[label] = last[:120]
                 # Try every strategy — tv-family often passes where web was walled.
                 continue
-        # loader.to rescue — their IPs + their CDN, immune to every bot-wall
-        alt = youtube_loader(url, audio_only=audio_only)
-        if alt:
-            return alt
         alt = youtube_pytubefix(url)
         if alt:
             return alt
