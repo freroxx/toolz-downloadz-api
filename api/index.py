@@ -23,7 +23,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -63,6 +63,15 @@ def _find_node_dir() -> Optional[str]:
 
 NODE_DIR = _find_node_dir()
 
+LOADER_QUALITIES = [
+    {"f": "loader_360",  "label": "360p"},
+    {"f": "loader_720",  "label": "720p"},
+    {"f": "loader_1080", "label": "1080p"},
+    {"f": "loader_1440", "label": "1440p"},
+    {"f": "loader_4k",   "label": "4K"},
+    {"f": "loader_mp3",  "label": "MP3"},
+]
+
 
 def _pot_plugin_installed() -> bool:
     """The bgutil yt-dlp plugin MUST be importable or tokens are never minted."""
@@ -71,7 +80,7 @@ def _pot_plugin_installed() -> bool:
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "26"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.8.2"
+VERSION = "3.9.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -339,7 +348,7 @@ def youtube_loader(url: str, quality: str = "720", audio_only: bool = False) -> 
         if not job or not job.get("success") or not job.get("progress_url"):
             return None
         dl, title = None, None
-        time.sleep(3.5)  # jobs typically finish in 8-14s; skip early empty polls
+        time.sleep(2.5)  # jobs typically finish in 8-14s
         for _ in range(7):  # ~15s polling window
             pr = _get_json(job["progress_url"], timeout=8)
             if not pr:
@@ -1044,6 +1053,8 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     cached = cache_get(key)
     if cached:
         out = dict(cached)
+        if platform == "youtube":
+            out.setdefault("quality_options", LOADER_QUALITIES)
         out["_cached"] = True
         return out
 
@@ -1063,6 +1074,8 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    if platform == "youtube":
+        result.setdefault("quality_options", LOADER_QUALITIES)
     if not result.get("blocked"):
         cache_set(key, result)
     return result
@@ -1113,6 +1126,19 @@ async def download(
     platform = detect_platform(page_url)
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL")
+
+    # On-demand server-side conversion qualities (loader.to). We 307-redirect
+    # to their CDN — zero Vercel bandwidth/duration limits even for 4K.
+    if f.startswith("loader_"):
+        q = f.split("_", 1)[1]
+        loop = asyncio.get_running_loop()
+        res = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: youtube_loader(page_url, quality=("mp3" if q == "mp3" else q), audio_only=(q == "mp3"))),
+            timeout=55)
+        if not (res and res.get("download_url")):
+            raise HTTPException(status_code=502,
+                                detail=f"{q} conversion failed — try another quality or re-extract.")
+        return RedirectResponse(res["download_url"], status_code=307)
 
     # Resolve + stream via explicit strategy chain. Each strategy is one
     # (resolve-mode, media-source) combo; first successful open wins.
