@@ -35,7 +35,7 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.2.2"
+VERSION = "3.3.1"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -440,19 +440,21 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         raise RuntimeError(f"YouTube extraction failed: {(last or 'unknown')[:300]}")
 
     if platform == "tiktok":
+        # tikwm first: ~1s, HD no-watermark, IP-free CDN. yt-dlp is the
+        # fallback because TikTok's anti-bot hangs/flags server IPs often,
+        # which previously burned the whole EXTRACT_TIMEOUT budget.
+        alt = tiktok_tikwm(url)
+        if alt:
+            return alt
         last = None
-        candidates = list(dict.fromkeys([url, tiktok_canonical(url)]))  # dedupe, keep order
-        for attempt in range(2):  # TikTok anti-bot is intermittent; retry once
+        candidates = list(dict.fromkeys([url, tiktok_canonical(url)]))
+        for attempt in range(2):
             for candidate in candidates:
                 try:
                     return shape(platform, run_ydl(ydl_opts("tiktok", audio_only, custom_format), candidate), url)
                 except Exception as e:
                     last = str(e)
             time.sleep(0.8)
-        # Cookie-free community engine — works even when TikTok flags our IP
-        alt = tiktok_tikwm(url)
-        if alt:
-            return alt
         meta = tiktok_oembed(url)
         if meta:
             return blocked_shape("tiktok", meta, url, BLOCK_MSGS["tiktok"])
@@ -521,6 +523,50 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"Internal error: {str(exc)[:200]}"})
+
+
+@app.get("/api/potcheck")
+async def potcheck():
+    """Diagnose POT provider reachability + token minting from THIS lambda."""
+    if not POT_PROVIDER_URL:
+        return {"configured": False, "hint": "Set YT_DLP_POT_PROVIDER_URL in Vercel env"}
+    base = POT_PROVIDER_URL.rstrip("/")
+    out: Dict[str, Any] = {"configured": True, "base": base}
+
+    t0 = time.time()
+    try:
+        req = urllib.request.Request(base + "/ping", headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            out["ping_status"] = r.status
+            out["ping_ms"] = int((time.time() - t0) * 1000)
+            out["ping_body"] = r.read(120).decode("utf-8", "ignore")
+    except Exception as e:
+        out["ping_ms"] = int((time.time() - t0) * 1000)
+        out["ping_error"] = str(e)[:200]
+        return out
+
+    # The plugin bails if ping >5s — flag that explicitly
+    if out.get("ping_ms", 9999) > 5000:
+        out["warning"] = f"ping took {out['ping_ms']}ms; yt-dlp plugin gives up after 5000ms and skips POT"
+
+    t1 = time.time()
+    try:
+        req = urllib.request.Request(
+            base + "/get_pot",
+            data=json.dumps({"bypass_cache": False}).encode(),
+            headers={"User-Agent": UA, "Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as r:
+            body = json.loads(r.read().decode("utf-8", "ignore"))
+            out["get_pot_ms"] = int((time.time() - t1) * 1000)
+            tok = body.get("poToken") or ""
+            out["token_preview"] = (tok[:24] + "…") if tok else None
+            out["mint_ok"] = bool(tok)
+    except Exception as e:
+        out["get_pot_ms"] = int((time.time() - t1) * 1000)
+        out["get_pot_error"] = str(e)[:250]
+        out["mint_ok"] = False
+    return out
 
 
 @app.get("/api/health")
