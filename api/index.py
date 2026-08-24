@@ -244,6 +244,7 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
             "vcodec": f.get("vcodec"), "acodec": f.get("acodec"),
             "height": f.get("height"), "tbr": f.get("tbr"), "abr": f.get("abr"),
             "headers": dict(f.get("http_headers") or {}),
+            "cookies": f.get("cookies"),  # TikTok needs ttwid etc. per-format
         }
         (audio if f.get("vcodec") == "none" else video).append(fmt)
 
@@ -542,6 +543,8 @@ async def download(
     headers = dict(result.get("download_headers") or {})
     if f == "best" or not f:
         media = result.get("download_url")
+        if not headers and result.get("formats", {}).get("video"):
+            headers = dict(result["formats"]["video"][0].get("headers") or {})
     else:
         media = None
         for group in ("video", "audio"):
@@ -556,34 +559,66 @@ async def download(
     if not media:
         raise HTTPException(status_code=404, detail="Format not found — re-extract the link first")
 
-    # Fetch & stream from THIS instance
+    # Per-format cookies (TikTok ttwid chain token) are REQUIRED or CDN returns empty
+    fmt_cookies = None
+    if f != "best":
+        for group in ("video", "audio"):
+            for fmt in result.get("formats", {}).get(group, []):
+                if str(fmt.get("format_id")) == f:
+                    fmt_cookies = fmt.get("cookies")
+                    break
+    if not fmt_cookies:
+        all_fmts = (result.get("formats", {}).get("video") or []) + (result.get("formats", {}).get("audio") or [])
+        fmt_cookies = next((x.get("cookies") for x in all_fmts if x.get("cookies")), None)
+    if fmt_cookies:
+        headers["Cookie"] = fmt_cookies
+
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
 
-    def _stream():
-        req = urllib.request.Request(media, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
+    # Open synchronously so failures become proper status codes (not truncated 200s)
+    def _open(extra=None):
+        h = dict(headers)
+        if extra:
+            h.update(extra)
+        req = urllib.request.Request(media, headers=h)
+        return urllib.request.urlopen(req, timeout=20)
+
+    try:
+        try:
+            resp = _open()
+        except urllib.error.HTTPError as e:
+            # Some CDNs require an explicit Range; retry once before failing
+            resp = _open({"Range": "bytes=0-"})
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Media source refused ({e.code}). Link may have expired — extract again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Media fetch failed: {str(e)[:200]}")
+
+    def _iter(r):
+        try:
             while True:
-                chunk = resp.read(65536)
+                chunk = r.read(65536)
                 if not chunk:
                     break
                 yield chunk
+        finally:
+            r.close()
 
-    try:
-        # Probe status/headers with a lightweight request first isn't possible with
-        # urllib streaming; instead we start streaming and let errors surface as 500.
-        out_headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
-            "Cache-Control": "no-store",
-        }
-        if range_header:
-            out_headers["Accept-Ranges"] = "bytes"
-        return StreamingResponse(_stream(), media_type="application/octet-stream", headers=out_headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Media fetch failed: {str(e)[:200]}")
+    out_headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+    }
+    for k in ("Content-Length", "Content-Range", "Content-Type"):
+        v = resp.headers.get(k)
+        if v:
+            out_headers[k] = v
+    status = 206 if resp.status == 206 else 200
+    return StreamingResponse(_iter(resp), status_code=status,
+                             media_type=resp.headers.get("Content-Type", "application/octet-stream"),
+                             headers=out_headers)
 
 
 if __name__ == "__main__":
