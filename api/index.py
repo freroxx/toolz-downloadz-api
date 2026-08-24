@@ -31,7 +31,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
-EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "8"))     # seconds; hobby-safe default
+EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
 VERSION = "3.0.0"
@@ -42,9 +42,11 @@ BASE_HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 
 SUPPORTED = ["youtube", "tiktok", "instagram"]
 
+# None = don't override player_client at all (yt-dlp defaults — best when cookies are set)
 YT_CLIENT_STRATEGIES = [
-    ["android", "web_safari", "mweb"],
-    ["ios", "tv"],
+    ["tv", "web_safari"],
+    ["android", "ios"],
+    None,
 ]
 
 # ----------------------------------------------------------------------------
@@ -171,7 +173,10 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best[ext=mp4]/best")
         opts["youtube_include_dash_manifest"] = False
         opts["youtube_include_hls_manifest"] = False
-        opts["extractor_args"]["youtube"] = {"player_client": yt_clients or YT_CLIENT_STRATEGIES[0]}
+        # Only pin clients when explicitly requested; with cookies, yt-dlp defaults
+        # + cookies beat any hardcoded rotation
+        if yt_clients:
+            opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
     elif platform == "tiktok":
         # NOTE: no api_hostname override — defaults are what currently work
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
@@ -335,6 +340,8 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 last = str(e)
                 if "Sign in to confirm" in last or "not a bot" in last:
                     break  # IP-flagged; rotating clients won't help
+                if clients is None:  # last strategy tried
+                    break
         alt = youtube_pytubefix(url)
         if alt:
             return alt
@@ -547,6 +554,13 @@ async def download(
                 result = await asyncio.wait_for(
                     loop.run_in_executor(None, lambda: extract_sync(page_url)), timeout=max(EXTRACT_TIMEOUT, 5)
                 )
+            except asyncio.TimeoutError:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Preparing the download timed out (~{EXTRACT_TIMEOUT}s). Tap Download once more — retries are faster and usually succeed.",
+                )
+            except HTTPException:
+                raise
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"Could not resolve media: {str(e)[:200]}")
             if result.get("blocked"):
