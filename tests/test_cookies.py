@@ -111,10 +111,12 @@ def test_blocked_card_carries_cookie_verdict(monkeypatch):
     _cookie_memo.update({"ts": 0, "payload": None})
     try:
         r = extract_sync("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        msg = r.get("blocked_message", "") or ""
-        assert "cookies=" in msg and ("expired" in msg or "aging" in msg)
     except RuntimeError:
         pytest.skip("network unavailable")
+    if not r.get("blocked"):
+        pytest.skip("IP not bot-flagged — blocked card path untestable here")
+    msg = r.get("blocked_message", "") or ""
+    assert "cookies=" in msg and ("expired" in msg or "aging" in msg)
 
 
 def test_potcheck_auth():

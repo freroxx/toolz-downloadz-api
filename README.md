@@ -32,6 +32,24 @@ Auth: send your key via `X-API-KEY: <key>` header (or `Authorization: Bearer <ke
 | `EXTRACT_TIMEOUT` | optional | Seconds before giving up (default 8 — hobby-plan safe) |
 | `CACHE_TTL`, `RATE_LIMIT` | optional | Cache seconds (3600), requests/min per IP (30) |
 
+## Cookie lifecycle (YouTube on Vercel)
+
+Vercel IPs get bot-walled; fresh login cookies are the reliable fix.
+
+1. **Diagnose** — `GET /api/diag` (with API key) → cookie verdict, days-to-rotation, POT health
+2. **Refresh without redeploy** — export fresh `cookies.txt` (Get cookies.txt LOCALLY, logged in) then:
+   ```bash
+   curl -X POST "https://<api>.vercel.app/api/admin/cookies" \
+        -H "X-API-KEY: $KEY" -H "Content-Type: text/plain" \
+        --data-binary @cookies.txt
+   ```
+   Requires Vercel KV connected (Storage → Create KV → connect project). Propagates to all lambdas ≤60s. Invalid/logged-out exports are rejected with the reason.
+3. **Smart gating** — expired/invalid cookies are never sent (they make blocks worse); `/api/diag` and the blocked card say exactly what's wrong.
+
+### Keep toolz-pot warm (cron-job.org, free)
+1. cron-job.org → Create cronjob → URL: `https://toolz-pot.vercel.app/ping`, every 5 min.
+   BotGuard stays initialized → token minting stays fast; also keeps yt-dlp's 5s provider-ping gate happy.
+
 ## Local dev
 
 ```bash
