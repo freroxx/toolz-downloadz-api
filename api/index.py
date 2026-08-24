@@ -35,7 +35,7 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -304,6 +304,10 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
     for f in info.get("formats") or []:
         if not f.get("url"):
             continue
+        # Skip HLS manifests — they're playlists, not downloadable files
+        proto = f.get("protocol") or ""
+        if "m3u8" in proto or f.get("ext") == "m3u8" or ".m3u8" in f["url"]:
+            continue
         fmt = {
             "format_id": f.get("format_id"), "ext": f.get("ext"),
             "resolution": f.get("resolution") or f.get("format_note") or "unknown",
@@ -334,7 +338,9 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
     dl_cookies = None
     # Merge-selected (POT/DASH): requested_formats holds the pair — prefer VIDEO
     if not dl and info.get("requested_formats"):
-        wanted = [f for f in info["requested_formats"] if f.get("vcodec") != "none"] or info["requested_formats"]
+        wanted = [f for f in info["requested_formats"]
+                  if f.get("vcodec") != "none" and "m3u8" not in (f.get("protocol") or "")
+                  and ".m3u8" not in (f.get("url") or "")] or info["requested_formats"]
         pick = wanted[0]
         dl = pick.get("url")
         hdrs = dict(pick.get("http_headers") or {})
