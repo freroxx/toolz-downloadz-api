@@ -42,7 +42,7 @@ COOKIES_KV_KEY = "toolz:yt_cookies"
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.4.1"
+VERSION = "3.4.2"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -367,21 +367,19 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         cf = _cookies_file(yt_ck["content"], "yt_cookies.txt") if yt_ck["content"] else None
         if cf:
             opts["cookiefile"] = cf
-        # Vercel has no ffmpeg → NEVER select merge-pairs ("bv*+ba"); yt-dlp
-        # silently skips merge candidates and errors "format not available".
-        # Single-file selectors only; progressive (A/V in one file) preferred.
+        # Vercel has no ffmpeg → NEVER select merge-pairs ("bv*+ba"). Also note
+        # yt-dlp's `best`/`b` only match A+V files; DASH-only sessions need `bv*`.
+        # Progressive first, then best pure-video file (UI lists audio separately).
         if POT_PROVIDER_URL:
             # PO-token provider (bgutil) — modern cookie-free YouTube bypass.
             opts["format"] = custom_format or (
                 "bestaudio/best" if audio_only
-                else "best[vcodec!=none][acodec!=none]/best")
+                else "best[vcodec!=none][acodec!=none]/bv*[protocol^=https]/bv*")
             opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": POT_PROVIDER_URL}
         else:
             opts["format"] = custom_format or (
                 "bestaudio/best" if audio_only
-                else "best[vcodec!=none][acodec!=none][ext=mp4]/best[vcodec!=none][acodec!=none]/best")
-            opts["youtube_include_dash_manifest"] = False
-            opts["youtube_include_hls_manifest"] = False
+                else "best[vcodec!=none][acodec!=none][ext=mp4]/bv*[protocol^=https][ext=mp4]/b")
         # Client pinning works with or without POT (plugin mints per-client)
         if yt_clients:
             opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
