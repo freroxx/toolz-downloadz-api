@@ -533,94 +533,105 @@ async def download(
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL")
 
-    # Resolve media URL — cache-first so warm lambdas are instant
-    key = _ckey(page_url, "False|None")
-    result = cache_get(key)
-    if not result or result.get("blocked"):
-        loop = asyncio.get_running_loop()
-        try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: extract_sync(page_url)), timeout=max(EXTRACT_TIMEOUT, 5)
-            )
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Could not resolve media: {str(e)[:200]}")
-        if result.get("blocked"):
-            raise HTTPException(status_code=409, detail=result.get("blocked_message", "Extraction blocked"))
-        cache_set(key, result)
-
-    # Pick format
-    headers = dict(result.get("download_headers") or {})
-    fmt_cookies = None
-    if f == "best" or not f:
-        media = result.get("download_url")
-        # Its OWN cookies — never borrow from another format (token pairing)
-        fmt_cookies = result.get("download_cookies")
-    else:
-        media = None
-        for group in ("video", "audio"):
-            for fmt in result.get("formats", {}).get(group, []):
-                if str(fmt.get("format_id")) == f:
-                    media, headers = fmt["url"], dict(fmt.get("headers") or {})
-                    fmt_cookies = fmt.get("cookies")
-                    break
-            if media:
-                break
-        if not media and result.get("download_url"):
-            media = result.get("download_url")
-            fmt_cookies = result.get("download_cookies")
-    if not media:
-        raise HTTPException(status_code=404, detail="Format not found — re-extract the link first")
-
-    # Per-format cookies (TikTok ttwid chain token) are REQUIRED or CDN returns empty/403
-    if fmt_cookies:
-        headers["Cookie"] = fmt_cookies
-
+    # Resolve media URL. Attempt 0 uses cache (instant); on expired/403 links we
+    # re-extract FRESH signatures once and retry before giving up.
     range_header = request.headers.get("range")
-    if range_header:
-        headers["Range"] = range_header
+    last_err = None
 
-    # Open synchronously so failures become proper status codes (not truncated 200s)
-    def _open(extra=None):
-        h = dict(headers)
-        if extra:
-            h.update(extra)
-        req = urllib.request.Request(media, headers=h)
-        return urllib.request.urlopen(req, timeout=20)
+    for attempt in range(2):
+        key = _ckey(page_url, "False|None")
+        result = cache_get(key) if attempt == 0 else None
+        if not result or result.get("blocked"):
+            loop = asyncio.get_running_loop()
+            try:
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: extract_sync(page_url)), timeout=max(EXTRACT_TIMEOUT, 5)
+                )
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Could not resolve media: {str(e)[:200]}")
+            if result.get("blocked"):
+                raise HTTPException(status_code=409, detail=result.get("blocked_message", "Extraction blocked"))
+            cache_set(key, result)
 
-    try:
-        try:
-            resp = _open()
-        except urllib.error.HTTPError as e:
-            # Some CDNs require an explicit Range; retry once before failing
-            resp = _open({"Range": "bytes=0-"})
-    except urllib.error.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"Media source refused ({e.code}). Link may have expired — extract again.")
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Media fetch failed: {str(e)[:200]}")
-
-    def _iter(r):
-        try:
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
+        # Pick format
+        headers = dict(result.get("download_headers") or {})
+        fmt_cookies = None
+        if f == "best" or not f:
+            media = result.get("download_url")
+            fmt_cookies = result.get("download_cookies")  # its OWN cookies (token pairing)
+        else:
+            media = None
+            for group in ("video", "audio"):
+                for fmt in result.get("formats", {}).get(group, []):
+                    if str(fmt.get("format_id")) == f:
+                        media, headers = fmt["url"], dict(fmt.get("headers") or {})
+                        fmt_cookies = fmt.get("cookies")
+                        break
+                if media:
                     break
-                yield chunk
-        finally:
-            r.close()
+            if not media and result.get("download_url"):
+                media = result.get("download_url")
+                fmt_cookies = result.get("download_cookies")
+        if not media:
+            raise HTTPException(status_code=404, detail="Format not found — re-extract the link first")
 
-    out_headers = {
-        "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
-        "Cache-Control": "no-store",
-        "Accept-Ranges": "bytes",
-    }
-    for k in ("Content-Length", "Content-Range", "Content-Type"):
-        v = resp.headers.get(k)
-        if v:
-            out_headers[k] = v
-    status = 206 if resp.status == 206 else 200
-    return StreamingResponse(_iter(resp), status_code=status,
-                             media_type=resp.headers.get("Content-Type", "application/octet-stream"),
-                             headers=out_headers)
+        if fmt_cookies:
+            headers["Cookie"] = fmt_cookies
+        if range_header:
+            headers["Range"] = range_header
+
+        def _open(extra=None):
+            h = dict(headers)
+            if extra:
+                h.update(extra)
+            req = urllib.request.Request(media, headers=h)
+            return urllib.request.urlopen(req, timeout=20)
+
+        try:
+            try:
+                resp = _open()
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 410) and attempt == 0:
+                    last_err = f"{e.code}"
+                    continue  # signature likely expired → fresh extract + retry
+                resp = _open({"Range": "bytes=0-"})  # some CDNs require explicit Range
+        except urllib.error.HTTPError as e:
+            if attempt == 0:
+                last_err = str(e.code)
+                continue
+            raise HTTPException(status_code=502,
+                                detail=f"Media source refused ({e.code}). Link expired — extract again.")
+        except Exception as e:
+            if attempt == 0:
+                last_err = str(e)
+                continue
+            raise HTTPException(status_code=502, detail=f"Media fetch failed: {str(e)[:200]}")
+
+        def _iter(r):
+            try:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                r.close()
+
+        out_headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "bytes",
+        }
+        for k in ("Content-Length", "Content-Range", "Content-Type"):
+            v = resp.headers.get(k)
+            if v:
+                out_headers[k] = v
+        status = 206 if resp.status == 206 else 200
+        return StreamingResponse(_iter(resp), status_code=status,
+                                 media_type=resp.headers.get("Content-Type", "application/octet-stream"),
+                                 headers=out_headers)
+
+    raise HTTPException(status_code=502, detail=f"Media source refused ({last_err}). Extract again.")
 
 
 if __name__ == "__main__":
