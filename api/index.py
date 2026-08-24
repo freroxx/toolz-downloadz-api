@@ -39,10 +39,16 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 KV_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or "").strip()
 KV_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or "").strip()
 COOKIES_KV_KEY = "toolz:yt_cookies"
+
+
+def _pot_plugin_installed() -> bool:
+    """The bgutil yt-dlp plugin MUST be importable or tokens are never minted."""
+    import importlib.util
+    return importlib.util.find_spec("yt_dlp_plugins.extractor.getpot_bgutil_http") is not None
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.4.3"
+VERSION = "3.4.4"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -585,8 +591,8 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 "youtube", meta, url,
                 BLOCK_MSGS["youtube"] + (
                     f"\n\n[diag: {diag} | pot={'on' if POT_PROVIDER_URL else 'off'} | "
-                    f"cookies={ck_state.get('verdict')} "
-                    f"({ck_state.get('hint')})]")
+                    f"cookies={ck_state.get('verdict')} | "
+                    f"plugin={'on' if _pot_plugin_installed() else 'MISSING — redeploy'}]")
             )
         raise RuntimeError(f"YouTube extraction failed: {(last or 'unknown')[:300]}")
 
@@ -737,7 +743,7 @@ async def ytdebug(request: Request, url: str = Query(...)):
     pot = _pot_status()
     ck = get_youtube_cookies()
     return {"url": clean, "results": results,
-            "pot": {"configured": bool(POT_PROVIDER_URL), **{k: pot.get(k) for k in ("ping_ms", "mint_ok", "get_pot_error", "warning") if k in pot}},
+            "pot": {"configured": bool(POT_PROVIDER_URL), "plugin_installed": _pot_plugin_installed(), **{k: pot.get(k) for k in ("ping_ms", "mint_ok", "get_pot_error", "warning") if k in pot}},
             "cookies": {k: v for k, v in ck.items() if k != "content"}}
 
 
