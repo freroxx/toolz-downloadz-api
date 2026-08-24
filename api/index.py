@@ -741,10 +741,6 @@ async def diag(request: Request):
 @app.post("/api/admin/cookies")
 async def admin_cookies_post(request: Request):
     check_auth(request)
-    if not (KV_REST_URL and KV_REST_TOKEN):
-        raise HTTPException(status_code=501,
-                            detail="Hot-reload needs Vercel KV / Upstash REST. "
-                                   "Vercel Dashboard → Storage → Create KV → connect this project.")
     ctype = (request.headers.get("content-type") or "").lower()
     if "application/json" in ctype:
         try:
@@ -757,6 +753,11 @@ async def admin_cookies_post(request: Request):
     analysis = _analyze_cookies(content)
     if analysis["verdict"] in ("invalid", "not_logged_in"):
         raise HTTPException(status_code=400, detail=f"Rejected: {analysis['hint']}")
+    if not (KV_REST_URL and KV_REST_TOKEN):
+        raise HTTPException(status_code=501,
+                            detail="Cookies look valid, but hot-reload needs Vercel KV / Upstash REST. "
+                                   "Vercel Dashboard → Storage → Create KV → connect this project. "
+                                   "(Or paste into YOUTUBE_COOKIES env + redeploy.)")
     ok = _kv_set(COOKIES_KV_KEY, content)
     if not ok:
         raise HTTPException(status_code=502, detail="KV write failed — check KV_REST_* env vars")
