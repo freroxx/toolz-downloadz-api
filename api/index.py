@@ -363,7 +363,8 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         "extractor_args": {},
     }
     if platform == "youtube":
-        cf = _cookies_file(YOUTUBE_COOKIES, "yt_cookies.txt")
+        yt_ck = get_youtube_cookies()
+        cf = _cookies_file(yt_ck["content"], "yt_cookies.txt") if yt_ck["content"] else None
         if cf:
             opts["cookiefile"] = cf
         if POT_PROVIDER_URL:
@@ -574,7 +575,10 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
             diag = (last or "unknown")[:180]
             return blocked_shape(
                 "youtube", meta, url,
-                BLOCK_MSGS["youtube"] + f"\n\n[diag: {diag} | pot={'on' if POT_PROVIDER_URL else 'off'} | cookies={'on' if YOUTUBE_COOKIES else 'off'}]",
+                BLOCK_MSGS["youtube"] + (
+                    f"\n\n[diag: {diag} | pot={'on' if POT_PROVIDER_URL else 'off'} | "
+                    f"cookies={ck_state.get('verdict')} "
+                    f"({ck_state.get('hint')})]")
             )
         raise RuntimeError(f"YouTube extraction failed: {(last or 'unknown')[:300]}")
 
@@ -664,37 +668,29 @@ async def unhandled(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"Internal error: {str(exc)[:200]}"})
 
 
-@app.get("/api/potcheck")
-async def potcheck():
-    """Diagnose POT provider reachability + token minting from THIS lambda."""
+def _pot_status() -> Dict[str, Any]:
     if not POT_PROVIDER_URL:
         return {"configured": False, "hint": "Set YT_DLP_POT_PROVIDER_URL in Vercel env"}
     base = POT_PROVIDER_URL.rstrip("/")
     out: Dict[str, Any] = {"configured": True, "base": base}
-
     t0 = time.time()
     try:
         req = urllib.request.Request(base + "/ping", headers={"User-Agent": UA})
         with urllib.request.urlopen(req, timeout=10) as r:
             out["ping_status"] = r.status
             out["ping_ms"] = int((time.time() - t0) * 1000)
-            out["ping_body"] = r.read(120).decode("utf-8", "ignore")
     except Exception as e:
         out["ping_ms"] = int((time.time() - t0) * 1000)
         out["ping_error"] = str(e)[:200]
         return out
-
-    # The plugin bails if ping >5s — flag that explicitly
-    if out.get("ping_ms", 9999) > 5000:
+    if out["ping_ms"] > 5000:
         out["warning"] = f"ping took {out['ping_ms']}ms; yt-dlp plugin gives up after 5000ms and skips POT"
-
     t1 = time.time()
     try:
         req = urllib.request.Request(
             base + "/get_pot",
             data=json.dumps({"bypass_cache": False}).encode(),
-            headers={"User-Agent": UA, "Content-Type": "application/json"},
-        )
+            headers={"User-Agent": UA, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=25) as r:
             body = json.loads(r.read().decode("utf-8", "ignore"))
             out["get_pot_ms"] = int((time.time() - t1) * 1000)
@@ -708,6 +704,84 @@ async def potcheck():
     return out
 
 
+@app.get("/api/potcheck")
+async def potcheck(request: Request):
+    check_auth(request)
+    return _pot_status()
+
+
+@app.get("/api/diag")
+async def diag(request: Request):
+    """Cookie doctor + POT status. Auth-protected (reveals session metadata)."""
+    check_auth(request)
+    ck = get_youtube_cookies()
+    ck_public = {k: v for k, v in ck.items() if k != "content"}
+    pot = _pot_status()
+    verdict = ck_public.get("verdict")
+    action = {
+        "fresh": "Nothing to do.",
+        "aging": ck_public.get("hint", ""),
+        "expired": "Re-export cookies from a logged-in youtube.com browser and POST to /api/admin/cookies.",
+        "not_logged_in": "Export was made while logged out. Log in, then re-export.",
+        "invalid": "Content is not a valid cookies.txt. Re-export via 'Get cookies.txt LOCALLY'.",
+        "none_set": "Set YOUTUBE_COOKIES in Vercel env or POST /api/admin/cookies.",
+    }[verdict]
+    return {
+        "version": VERSION,
+        "cookies": {**ck_public,
+                    "action": action,
+                    "kv_configured": bool(KV_REST_URL and KV_REST_TOKEN)},
+        "pot": pot,
+        "effective": {"youtube_cookies_sent": bool(ck.get("content")),
+                      "instagram_cookies": bool(INSTAGRAM_COOKIES)},
+    }
+
+
+@app.post("/api/admin/cookies")
+async def admin_cookies_post(request: Request):
+    check_auth(request)
+    if not (KV_REST_URL and KV_REST_TOKEN):
+        raise HTTPException(status_code=501,
+                            detail="Hot-reload needs Vercel KV / Upstash REST. "
+                                   "Vercel Dashboard → Storage → Create KV → connect this project.")
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            body = await request.json()
+            content = (body or {}).get("cookies", "")
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+    else:
+        content = (await request.body()).decode("utf-8", "ignore")
+    analysis = _analyze_cookies(content)
+    if analysis["verdict"] in ("invalid", "not_logged_in"):
+        raise HTTPException(status_code=400, detail=f"Rejected: {analysis['hint']}")
+    ok = _kv_set(COOKIES_KV_KEY, content)
+    if not ok:
+        raise HTTPException(status_code=502, detail="KV write failed — check KV_REST_* env vars")
+    _cookie_memo.update({"ts": 0.0, "payload": None})  # this lambda refreshes instantly
+    days = analysis.get("days_left")
+    return {"stored": True, "verdict": analysis["verdict"],
+            "logged_in": analysis["logged_in"],
+            "days_left": round(days, 1) if isinstance(days, (int, float)) else days,
+            "note": "Other lambdas pick it up within 60s."}
+
+
+@app.delete("/api/admin/cookies")
+async def admin_cookies_delete(request: Request):
+    check_auth(request)
+    _kv_del(COOKIES_KV_KEY)
+    _cookie_memo.update({"ts": 0.0, "payload": None})
+    return {"cleared": True}
+
+
+@app.get("/api/admin/cookies")
+async def admin_cookies_get(request: Request):
+    check_auth(request)
+    ck = get_youtube_cookies()
+    return {k: v for k, v in ck.items() if k != "content"}
+
+
 @app.get("/api/health")
 async def health():
     return {
@@ -716,7 +790,7 @@ async def health():
         "version": VERSION,
         "platforms": SUPPORTED,
         "auth": bool(API_SECRET_KEY),
-        "cookies": {"youtube": bool(YOUTUBE_COOKIES), "instagram": bool(INSTAGRAM_COOKIES)},
+        "cookies": {"youtube": get_youtube_cookies().get("verdict"), "instagram": bool(INSTAGRAM_COOKIES)},
     }
 
 
