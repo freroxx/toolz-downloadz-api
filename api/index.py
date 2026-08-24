@@ -43,6 +43,17 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 KV_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or "").strip()
 KV_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or "").strip()
 COOKIES_KV_KEY = "toolz:yt_cookies"
+COBALT_API_URL = (os.getenv("COBALT_API_URL") or "").strip().rstrip("/")
+COBALT_API_KEY = (os.getenv("COBALT_API_KEY") or "").strip()  # if your instance requires a key
+
+COBALT_QUALITIES = [
+    {"f": "cobalt_360",  "label": "360p"},
+    {"f": "cobalt_720",  "label": "720p"},
+    {"f": "cobalt_1080", "label": "1080p"},
+    {"f": "cobalt_1440", "label": "1440p"},
+    {"f": "cobalt_2160", "label": "4K"},
+    {"f": "cobalt_mp3",  "label": "MP3"},
+]
 
 
 def _find_node_dir() -> Optional[str]:
@@ -63,14 +74,6 @@ def _find_node_dir() -> Optional[str]:
 
 NODE_DIR = _find_node_dir()
 
-LOADER_QUALITIES = [
-    {"f": "loader_360",  "label": "360p"},
-    {"f": "loader_720",  "label": "720p"},
-    {"f": "loader_1080", "label": "1080p"},
-    {"f": "loader_1440", "label": "1440p"},
-    {"f": "loader_4k",   "label": "4K"},
-    {"f": "loader_mp3",  "label": "MP3"},
-]
 
 
 def _pot_plugin_installed() -> bool:
@@ -303,6 +306,49 @@ def tiktok_canonical(url: str) -> str:
     return url.split("?")[0].split("#")[0]
 
 
+def _cobalt_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    headers = {"Accept": "application/json", "Content-Type": "application/json",
+               "User-Agent": UA}
+    if COBALT_API_KEY:
+        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
+    req = urllib.request.Request(COBALT_API_URL + "/", data=json.dumps(payload).encode(),
+                                 headers=headers)
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _cobalt_pick(url: str, quality: str) -> Optional[Dict[str, Any]]:
+    """
+    Ask YOUR cobalt instance for the media. Returns {"url","filename"} on
+    success (tunnel = streamed via your instance → IP-free for downloader),
+    or {"error": ...}.
+    """
+    if not COBALT_API_URL:
+        return {"error": "COBALT_API_URL not configured"}
+    payload: Dict[str, Any] = {
+        "url": url,
+        "videoQuality": {"360": "360", "480": "480", "720": "720",
+                         "1080": "1080", "1440": "1440", "2160": "2160"}.get(quality, "720"),
+        "youtubeVideoCodec": "h264",   # avc1 plays everywhere & muxes into mp4
+        "downloadMode": "auto",
+        "filenameStyle": "basic",
+    }
+    if quality == "mp3":
+        payload["downloadMode"] = "audio"
+        payload["audioFormat"] = "mp3"
+        payload["audioBitrate"] = "320"
+        payload.pop("videoQuality", None)
+        payload.pop("youtubeVideoCodec", None)
+    try:
+        data = _cobalt_request(payload)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    status = data.get("status")
+    if status in ("tunnel", "redirect", "local-processing") and data.get("url"):
+        return {"url": data["url"], "filename": data.get("filename"), "status": status}
+    return {"error": str(data.get("text") or data.get("error") or status or data)[:200]}
+
+
 def _yt_video_id(url: str) -> Optional[str]:
     """Extract the 11-char video id from any YouTube URL shape."""
     p = urllib.parse.urlparse(url)
@@ -319,78 +365,6 @@ def _yt_video_id(url: str) -> Optional[str]:
             return parts[i + 1]
     m = re.search(r"[a-zA-Z0-9_-]{11}", url)
     return m.group(0) if m else None
-
-
-def _get_json(url: str, timeout: int = 12) -> Optional[dict]:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except Exception:
-        return None
-
-
-def youtube_loader(url: str, quality: str = "720", audio_only: bool = False) -> Optional[dict]:
-    """
-    Community-backend rescue (loader.to): THEY do the extraction on their IPs
-    and host the finished file on their own CDN — completely IP-free for us,
-    exactly like tikwm does for TikTok. Survives every YouTube bot-wall.
-    """
-    vid = _yt_video_id(url)
-    if not vid:
-        return None
-    page = f"https://www.youtube.com/watch?v={vid}"
-    fmt = "mp3" if audio_only else quality
-    try:
-        job = _get_json(
-            "https://loader.to/ajax/download.php?format=" + fmt +
-            "&url=" + urllib.parse.quote(page, safe=""))
-        if not job or not job.get("success") or not job.get("progress_url"):
-            return None
-        dl, title = None, None
-        time.sleep(2.5)  # jobs typically finish in 8-14s
-        for _ in range(7):  # ~15s polling window
-            pr = _get_json(job["progress_url"], timeout=8)
-            if not pr:
-                time.sleep(2)
-                continue
-            if not pr:
-                continue
-            title = pr.get("title") or title
-            if pr.get("download_url"):
-                dl = pr["download_url"]
-                break
-            time.sleep(2)
-        if not dl:
-            return None
-    except Exception:
-        return None
-
-    ext = "mp3" if audio_only else "mp4"
-    entry = {
-        "format_id": f"loader_{fmt}", "ext": ext,
-        "resolution": ("audio" if audio_only else f"{quality}p A+V"),
-        "url": dl, "filesize": None,
-        "vcodec": "none" if audio_only else "avc1",
-        "acodec": None if audio_only else "mp4a",
-        "height": None, "tbr": None, "abr": None,
-        "headers": {"User-Agent": UA}, "cookies": None,
-    }
-    return {
-        "platform": "youtube",
-        "title": title or f"YouTube {vid}",
-        "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-        "duration": None, "uploader": None, "uploader_url": None,
-        "stats": {}, "upload_date": None, "description": None,
-        "download_url": dl, "download_headers": {"User-Agent": UA},
-        "download_cookies": None,
-        "ext": ext, "blocked": False, "source": "loader",
-        "formats": {"video": [] if audio_only else [entry],
-                    "audio": [dict(entry, format_id="loader_mp3", ext="mp3",
-                                   vcodec="none", acodec="mp3", resolution="audio")]
-                             if audio_only else []},
-        "original_url": url,
-    }
 
 
 def _mint_video_bound_token(video_id: str) -> Optional[str]:
@@ -708,14 +682,6 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         ck_state = get_youtube_cookies()
         last = None
 
-        # STRATEGY 1 — loader.to rescue FIRST on serverless.
-        # Google deterministically bot-walls every yt-dlp strategy from Vercel
-        # datacenter IPs; loader extracts on THEIR IPs and hosts the MP4 on an
-        # IP-free CDN (~10-15s). Only when it's down do we burn time on yt-dlp.
-        alt = youtube_loader(url, audio_only=audio_only)
-        if alt:
-            return alt
-
         # Warm the POT provider (cold boot + BotGuard init can take 5-10s;
         # the plugin's own HTTP timeout is shorter than that). We're already
         # inside an executor thread here, so blocking is fine.
@@ -752,19 +718,52 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 strategy_errors[label] = last[:120]
                 # Try every strategy — tv-family often passes where web was walled.
                 continue
+        # Open-source rescue: YOUR cobalt instance extracts on ITS egress IP
+        # and tunnels the file — completely sidesteps our datacenter reputation.
+        if COBALT_API_URL:
+            res = _cobalt_pick(url, "720" if not audio_only else "mp3")
+            if res and res.get("url"):
+                entry = {
+                    "format_id": f"cobalt_{('mp3' if audio_only else '720')}",
+                    "ext": "mp3" if audio_only else "mp4",
+                    "resolution": "audio" if audio_only else "720p A+V",
+                    "url": res["url"], "filesize": None,
+                    "vcodec": "none" if audio_only else "avc1",
+                    "acodec": None if audio_only else "mp4a",
+                    "height": None, "tbr": None, "abr": None,
+                    "headers": {"User-Agent": UA}, "cookies": None,
+                }
+                out = blocked_shape(platform, {"title": f"YouTube {_yt_video_id(url) or ''}".strip(),
+                                               "thumbnail": None}, url, "") if False else None
+                return {
+                    "platform": platform,
+                    "title": f"YouTube video {(_yt_video_id(url) or '').strip()}",
+                    "thumbnail": None, "duration": None, "uploader": None, "uploader_url": None,
+                    "stats": {}, "upload_date": None, "description": None,
+                    "download_url": res["url"],
+                    "download_headers": {"User-Agent": UA},
+                    "download_cookies": None,
+                    "ext": "mp3" if audio_only else "mp4",
+                    "blocked": False, "source": "cobalt",
+                    "formats": {"video": [] if audio_only else [entry],
+                                "audio": [dict(entry, format_id="cobalt_mp3", ext="mp3",
+                                               vcodec="none", acodec="mp3", resolution="audio")] if audio_only else []},
+                    "original_url": url,
+                }
         alt = youtube_pytubefix(url)
         if alt:
             return alt
         meta = youtube_oembed(url)
         if meta:
-            strat = " | ".join(f"{k}:{v.split(':')[0][:48]}" for k, v in list(strategy_errors.items())[:4])
+            pass_placeholder = None(f"{k}:{v.split(':')[0][:48]}" for k, v in list(strategy_errors.items())[:4])
             diag = f"{(last or 'unknown')[:120]} [{strat}]"
             return blocked_shape(
                 "youtube", meta, url,
                 BLOCK_MSGS["youtube"] + (
                     f"\n\n[diag: {diag} | pot={'on' if POT_PROVIDER_URL else 'off'} | "
                     f"cookies={ck_state.get('verdict')} | "
-                    f"plugin={'on' if _pot_plugin_installed() else 'MISSING — redeploy'}]")
+                    f"plugin={'on' if _pot_plugin_installed() else 'MISSING'} | "
+                    f"cobalt={'on' if COBALT_API_URL else 'off'}]")
             )
         raise RuntimeError(f"YouTube extraction failed: {(last or 'unknown')[:300]}")
 
@@ -1053,8 +1052,8 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     cached = cache_get(key)
     if cached:
         out = dict(cached)
-        if platform == "youtube":
-            out.setdefault("quality_options", LOADER_QUALITIES)
+        if platform == "youtube" and COBALT_API_URL:
+            out.setdefault("quality_options", COBALT_QUALITIES)
         out["_cached"] = True
         return out
 
@@ -1074,8 +1073,8 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if platform == "youtube":
-        result.setdefault("quality_options", LOADER_QUALITIES)
+    if platform == "youtube" and COBALT_API_URL:
+        result.setdefault("quality_options", COBALT_QUALITIES)
     if not result.get("blocked"):
         cache_set(key, result)
     return result
@@ -1127,18 +1126,20 @@ async def download(
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL")
 
-    # On-demand server-side conversion qualities (loader.to). We 307-redirect
-    # to their CDN — zero Vercel bandwidth/duration limits even for 4K.
-    if f.startswith("loader_"):
+    # On-demand quality ladder via YOUR open-source cobalt instance
+    # (AGPL — https://github.com/imputnet/cobalt). Set COBALT_API_URL after
+    # deploying it anywhere (Docker/Render/Railway/…). Tunnel URLs stream via
+    # your instance, so downloads work regardless of our egress IP.
+    if f.startswith("cobalt_"):
         q = f.split("_", 1)[1]
         loop = asyncio.get_running_loop()
         res = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: youtube_loader(page_url, quality=("mp3" if q == "mp3" else q), audio_only=(q == "mp3"))),
+            loop.run_in_executor(None, lambda: _cobalt_pick(page_url, q)),
             timeout=55)
-        if not (res and res.get("download_url")):
+        if not (res and res.get("url")):
             raise HTTPException(status_code=502,
-                                detail=f"{q} conversion failed — try another quality or re-extract.")
-        return RedirectResponse(res["download_url"], status_code=307)
+                                detail=f"{q} via cobalt failed: {str((res or {}).get('error'))[:120] or 'no url'}")
+        return RedirectResponse(res["url"], status_code=307)
 
     # Resolve + stream via explicit strategy chain. Each strategy is one
     # (resolve-mode, media-source) combo; first successful open wins.
