@@ -115,6 +115,138 @@ def _cookies_file(content: str, name: str) -> Optional[str]:
         return None
 
 
+# --- Cookie lifecycle: analyze, KV hot-reload, gate -------------------------
+LOGIN_PROOF = ("SID", "__Secure-1PSID", "LOGIN_INFO")
+ROTATING = ("SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC")
+
+_cookie_memo = {"ts": 0.0, "payload": None}  # memoized resolver result (60s)
+
+
+def _parse_cookies(content: str) -> Dict[str, dict]:
+    """Netscape format -> {name: {expiry:int, domain:str, value:str}}"""
+    out: Dict[str, dict] = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _flag, _path, _secure, expiry, name = parts[:6]
+        out[name] = {"expiry": int(expiry) if expiry.isdigit() else 0,
+                     "domain": domain, "value": parts[6]}
+    return out
+
+
+def _analyze_cookies(content: str) -> Dict[str, Any]:
+    """Verdict engine: fresh | aging | expired | not_logged_in | invalid."""
+    if not content or not content.strip():
+        return {"verdict": "none_set", "logged_in": False, "days_left": None,
+                "expired": [], "hint": "No cookies configured."}
+    cookies = _parse_cookies(content)
+    names = set(cookies)
+    if not names:
+        return {"verdict": "invalid", "logged_in": False, "days_left": None,
+                "expired": [], "hint": "Content is not Netscape cookie format."}
+    logged_in = bool(names & {"SID", "__Secure-1PSID"}) or "LOGIN_INFO" in names
+    now = time.time()
+    expired, days_left_min = [], None
+    rot = [n for n in ROTATING if n in cookies]
+    if rot:
+        for n in rot:
+            left = (cookies[n]["expiry"] - now) / 86400.0
+            days_left_min = left if days_left_min is None else min(days_left_min, left)
+            if left <= 0:
+                expired.append(n)
+        dl = round(max(days_left_min, 0), 1)
+    else:
+        dl = None  # no rotating cookies present — can't judge freshness
+    if not logged_in:
+        verdict = "not_logged_in"
+    elif expired or (dl is not None and dl <= 0):
+        verdict = "expired"
+    elif dl is not None and dl < 2:
+        verdict = "aging"
+    else:
+        verdict = "fresh"
+    hint = {
+        "fresh": f"OK — ~{dl}d until rotation.",
+        "aging": f"Rotates soon (~{dl}d). Refresh when convenient.",
+        "expired": "Session cookies expired — YouTube will bot-block. Re-export.",
+        "not_logged_in": "Export lacks login cookies (no SID). Export while logged in.",
+        "invalid": "Unparsable content.",
+        "none_set": "Not configured.",
+    }[verdict]
+    return {"verdict": verdict, "logged_in": logged_in, "days_left": dl,
+            "expired": expired, "hint": hint}
+
+
+def _kv_get(key: str) -> Optional[str]:
+    if not (KV_REST_URL and KV_REST_TOKEN):
+        return None
+    try:
+        req = urllib.request.Request(
+            f"{KV_REST_URL.rstrip('/')}/get/{urllib.parse.quote(key, safe='')}",
+            headers={"Authorization": f"Bearer {KV_REST_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        raw = data.get("result")
+        return raw if isinstance(raw, str) else None
+    except Exception:
+        return None
+
+
+def _kv_set(key: str, value: str) -> bool:
+    if not (KV_REST_URL and KV_REST_TOKEN):
+        return False
+    try:
+        req = urllib.request.Request(
+            f"{KV_REST_URL.rstrip('/')}/set/{urllib.parse.quote(key, safe='')}",
+            data=value.encode("utf-8"),
+            headers={"Authorization": f"Bearer {KV_REST_TOKEN}",
+                     "Content-Type": "text/plain"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        return True
+    except Exception:
+        return False
+
+
+def _kv_del(key: str) -> bool:
+    if not (KV_REST_URL and KV_REST_TOKEN):
+        return False
+    try:
+        req = urllib.request.Request(
+            f"{KV_REST_URL.rstrip('/')}/del/{urllib.parse.quote(key, safe='')}",
+            headers={"Authorization": f"Bearer {KV_REST_TOKEN}"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
+        return True
+    except Exception:
+        return False
+
+
+def get_youtube_cookies() -> Dict[str, Any]:
+    """
+    Effective YouTube cookies with precedence KV > env, gated by freshness.
+    Returns {"content": str|None (None = do NOT send), "source", **analysis}.
+    Memoized 60s so per-request latency stays zero; admin POST invalidates locally.
+    """
+    now = time.time()
+    if _cookie_memo["payload"] and now - _cookie_memo["ts"] < 60:
+        return _cookie_memo["payload"]
+    kv = _kv_get(COOKIES_KV_KEY)
+    source = "kv" if kv else "env"
+    content = kv or YOUTUBE_COOKIES
+    analysis = _analyze_cookies(content)
+    # Smart gating: never send dead/invalid sessions — they make blocks worse.
+    send = analysis["verdict"] in ("fresh", "aging") and analysis["logged_in"] and content
+    payload = {"content": content if send else None, "raw_present": bool(content),
+               "source": source if content else "none", **analysis}
+    _cookie_memo.update({"ts": now, "payload": payload})
+    return payload
+
+
 # ----------------------------------------------------------------------------
 # Platform detection — strict allowlist
 # ----------------------------------------------------------------------------
