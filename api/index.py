@@ -71,7 +71,7 @@ def _pot_plugin_installed() -> bool:
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.5.1"
+VERSION = "3.5.2"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -310,6 +310,74 @@ def _yt_video_id(url: str) -> Optional[str]:
             return parts[i + 1]
     m = re.search(r"[a-zA-Z0-9_-]{11}", url)
     return m.group(0) if m else None
+
+
+def _get_json(url: str, timeout: int = 12) -> Optional[dict]:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def youtube_loader(url: str, quality: str = "720", audio_only: bool = False) -> Optional[dict]:
+    """
+    Community-backend rescue (loader.to): THEY do the extraction on their IPs
+    and host the finished file on their own CDN — completely IP-free for us,
+    exactly like tikwm does for TikTok. Survives every YouTube bot-wall.
+    """
+    vid = _yt_video_id(url)
+    if not vid:
+        return None
+    page = f"https://www.youtube.com/watch?v={vid}"
+    fmt = "mp3" if audio_only else quality
+    try:
+        job = _get_json(
+            "https://loader.to/ajax/download.php?format=" + fmt +
+            "&url=" + urllib.parse.quote(page, safe=""))
+        if not job or not job.get("success") or not job.get("progress_url"):
+            return None
+        dl, title = None, None
+        for _ in range(7):  # ~15s inside EXTRACT_TIMEOUT budget
+            time.sleep(2.2)
+            pr = _get_json(job["progress_url"], timeout=8)
+            if not pr:
+                continue
+            title = pr.get("title") or title
+            if pr.get("download_url"):
+                dl = pr["download_url"]
+                break
+        if not dl:
+            return None
+    except Exception:
+        return None
+
+    ext = "mp3" if audio_only else "mp4"
+    entry = {
+        "format_id": f"loader_{fmt}", "ext": ext,
+        "resolution": ("audio" if audio_only else f"{quality}p A+V"),
+        "url": dl, "filesize": None,
+        "vcodec": "none" if audio_only else "avc1",
+        "acodec": None if audio_only else "mp4a",
+        "height": None, "tbr": None, "abr": None,
+        "headers": {"User-Agent": UA}, "cookies": None,
+    }
+    return {
+        "platform": "youtube",
+        "title": title or f"YouTube {vid}",
+        "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+        "duration": None, "uploader": None, "uploader_url": None,
+        "stats": {}, "upload_date": None, "description": None,
+        "download_url": dl, "download_headers": {"User-Agent": UA},
+        "download_cookies": None,
+        "ext": ext, "blocked": False, "source": "loader",
+        "formats": {"video": [] if audio_only else [entry],
+                    "audio": [dict(entry, format_id="loader_mp3", ext="mp3",
+                                   vcodec="none", acodec="mp3", resolution="audio")]
+                             if audio_only else []},
+        "original_url": url,
+    }
 
 
 def _mint_video_bound_token(video_id: str) -> Optional[str]:
@@ -662,6 +730,10 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 strategy_errors[label] = last[:120]
                 # Try every strategy — tv-family often passes where web was walled.
                 continue
+        # loader.to rescue — their IPs + their CDN, immune to every bot-wall
+        alt = youtube_loader(url, audio_only=audio_only)
+        if alt:
+            return alt
         alt = youtube_pytubefix(url)
         if alt:
             return alt
