@@ -1,0 +1,51 @@
+services:
+  api:
+    build: .
+    container_name: toolz-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override for compose: allow web on localhost
+      CORS_ORIGINS: "${CORS_ORIGINS:-*}"
+      REDIS_URL: "redis://redis:6379/0"
+      YT_DLP_POT_PROVIDER_URL: "http://bgutil:4416"
+    depends_on:
+      redis:
+        condition: service_healthy
+      bgutil:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    container_name: toolz-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  bgutil:
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: toolz-bgutil
+    ports:
+      - "4416:4416"
+    restart: unless-stopped
+    # No healthcheck — image has no curl; assume started
+
+volumes:
+  redis_data:
