@@ -123,12 +123,13 @@ def build_ydl_opts(
             opts["extractor_args"]["instagram"].update(extra_extractor_args["instagram"])
 
     elif platform == "tiktok":
-        opts["extractor_args"]["tiktok"] = {
-            "api_hostname": "api16-normal-useast5.us.tiktok.com",
-            "web_instance_url": "https://www.tiktok.com/",
-        }
+        # Vercel fix: default yt-dlp TikTok extractor now works best without custom api_hostname.
+        # The old "api16-normal-useast5.us.tiktok.com" host is outdated and causes
+        # "Unable to extract universal data for rehydration" on real URLs like
+        # https://www.tiktok.com/@carterpcs/video/7677478472293289247
+        # So we don't override unless user explicitly provides extra args.
         if extra_extractor_args and "tiktok" in extra_extractor_args:
-            opts["extractor_args"]["tiktok"].update(extra_extractor_args["tiktok"])
+            opts["extractor_args"]["tiktok"] = extra_extractor_args["tiktok"]
 
     elif platform == "twitter":
         opts["extractor_args"]["twitter"] = {"mobile_redirect": True}
@@ -159,6 +160,47 @@ def youtube_oembed(url: str) -> Optional[dict]:
         }
     except Exception:
         return None
+
+
+def tiktok_oembed(url: str) -> Optional[dict]:
+    """Fetch basic metadata from TikTok's public oEmbed endpoint. Never blocked, works on Vercel."""
+    try:
+        # TikTok oEmbed expects canonical URL without extra query like is_from_webapp
+        # Strip to https://www.tiktok.com/@user/video/ID
+        base = url.split("?")[0].split("#")[0]
+        # Ensure it's a tiktok video URL
+        if "/video/" not in base:
+            base = url
+        oembed_url = "https://www.tiktok.com/oembed?url=" + urllib.parse.quote(base, safe="")
+        req = urllib.request.Request(oembed_url, headers=BASE_HEADERS)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        # TikTok oEmbed returns thumbnail_url, author_name, author_url, title
+        thumb = data.get("thumbnail_url")
+        # Try to get better thumbnail: oEmbed thumbnail is often low-res, but ok for fallback
+        return {
+            "title": data.get("title") or data.get("author_name") or "TikTok Video",
+            "uploader": data.get("author_name"),
+            "uploader_url": data.get("author_url"),
+            "thumbnail": thumb,
+        }
+    except Exception:
+        return None
+
+
+def tiktok_canonical_url(url: str) -> str:
+    """Strip TikTok tracking query params to canonical form that yt-dlp handles best."""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url)
+        # Keep only path, remove query and fragment
+        canonical = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        # Ensure https and www
+        if "tiktok.com" in canonical and not canonical.startswith("https://"):
+            canonical = "https://" + canonical.lstrip("https://").lstrip("/")
+        return canonical
+    except:
+        return url.split("?")[0]
 
 
 def normalize_streams(info: dict) -> Tuple[List[dict], List[dict]]:
@@ -443,6 +485,31 @@ def blocked_response(meta: dict, original_url: Optional[str] = None) -> dict:
     }
 
 
+def tiktok_blocked_response(meta: dict, original_url: Optional[str] = None) -> dict:
+    return {
+        "platform": "tiktok",
+        "title": meta.get("title") or "TikTok Video",
+        "thumbnail": meta.get("thumbnail"),
+        "duration": None,
+        "uploader": meta.get("uploader"),
+        "uploader_url": meta.get("uploader_url"),
+        "stats": {"views": None, "likes": None, "comments": None, "reposts": None, "creator_followers": None},
+        "description": None,
+        "download_url": None,
+        "upload_date": None,
+        "download_headers": {},
+        "blocked": True,
+        "blocked_message": (
+            "TikTok extraction failed on this Vercel IP (yt-dlp rehydration error). "
+            "Metadata below is from TikTok's public oEmbed API (never blocked). "
+            "Try the canonical URL without ?is_from_webapp params, or retry in a minute. "
+            "Direct download links need yt-dlp to succeed."
+        ),
+        "formats": {"video": [], "audio": []},
+        "original_url": original_url,
+    }
+
+
 # Main orchestration — called by routers
 def extract_media_sync(
     url: str,
@@ -493,6 +560,62 @@ def extract_media_sync(
             "Add YOUTUBE_COOKIES in Vercel env (see README) to bypass, or retry — blocks are temporary."
         )
 
+    # Platform-specific robust handling for TikTok (Vercel's most flaky after YouTube)
+    if platform == "tiktok":
+        # Try original URL, then canonical without query params (yt-dlp handles canonical best)
+        candidates = [url]
+        canon = tiktok_canonical_url(url)
+        if canon != url:
+            candidates.append(canon)
+        last_err = None
+        for trial_url in candidates:
+            try:
+                ydl_opts = build_ydl_opts(
+                    platform,
+                    custom_format=custom_format,
+                    audio_only=audio_only,
+                    playlist=playlist,
+                    playlist_items=playlist_items,
+                    include_subtitles=include_subtitles,
+                    extra_extractor_args=extra_extractor_args,
+                )
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(trial_url, download=False)
+                return build_response(platform, info, original_url=url)
+            except Exception as e:
+                last_err = str(e)
+                # If it's the rehydration error, try next candidate (canonical)
+                if "universal data" in last_err.lower() and trial_url == url and len(candidates) > 1:
+                    continue
+                # For other errors, still try next candidate if available
+                if trial_url == url and len(candidates) > 1:
+                    continue
+                break
+        # oEmbed fallback — never blocked, at least returns title/thumbnail
+        # 10x robustness: always return 200 with metadata, never hard 400 for TikTok
+        meta = tiktok_oembed(url)
+        if meta:
+            return tiktok_blocked_response(meta, original_url=url)
+        # Even if oEmbed fails (rare), return minimal blocked response instead of hard error
+        # This ensures the API is always responsive for TikTok, even under Vercel blocks
+        return {
+            "platform": "tiktok",
+            "title": f"TikTok Video {url.split('/')[-1].split('?')[0]}",
+            "thumbnail": None,
+            "duration": None,
+            "uploader": None,
+            "uploader_url": None,
+            "stats": {"views": None, "likes": None, "comments": None, "reposts": None, "creator_followers": None},
+            "description": None,
+            "download_url": None,
+            "upload_date": None,
+            "download_headers": {},
+            "blocked": True,
+            "blocked_message": clean_error(last_err or "TikTok extraction failed", "tiktok"),
+            "formats": {"video": [], "audio": []},
+            "original_url": url,
+        }
+
     # Generic path for all other platforms (and YouTube playlists)
     ydl_opts = build_ydl_opts(
         platform,
@@ -508,4 +631,9 @@ def extract_media_sync(
             info = ydl.extract_info(url, download=False)
         return build_response(platform, info, original_url=url)
     except Exception as e:
+        # Try oEmbed for platforms that support it
+        if platform == "tiktok":
+            meta = tiktok_oembed(url)
+            if meta:
+                return tiktok_blocked_response(meta, original_url=url)
         raise RuntimeError(clean_error(str(e), platform)) from e
