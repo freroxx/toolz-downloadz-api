@@ -19,7 +19,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -497,6 +497,93 @@ async def extract_post(request: Request, body: Dict[str, Any] = None):
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' in body")
     return await do_extract(request, url, bool(body.get("audio_only")), body.get("format"))
+
+
+# ----------------------------------------------------------------------------
+# One-step download: resolve formats + stream media FROM THE SAME LAMBDA.
+# Critical because YouTube/TikTok sign media URLs to the requesting IP — a
+# separate proxy server gets 403. Same-instance fetch keeps the signature valid.
+# ----------------------------------------------------------------------------
+def _sanitize_name(name: str) -> str:
+    keep = "".join(c if (c.isalnum() or c in " ._-") else " " for c in name)
+    return (" ".join(keep.split()) or "media")[:120]
+
+
+@app.get("/api/download")
+async def download(
+    request: Request,
+    u: str = Query(..., description="Original page URL"),
+    f: str = Query("best", description="yt-dlp format_id, or 'best'"),
+    n: str = Query("", description="Filename"),
+):
+    ident = request.client.host if request.client else "anon"
+    check_auth(request)  # supports ?key= for browser navigation
+    page_url = clean_url(u)
+    platform = detect_platform(page_url)
+    if not platform:
+        raise HTTPException(status_code=400, detail="Unsupported URL")
+
+    # Resolve media URL — cache-first so warm lambdas are instant
+    key = _ckey(page_url, "False|None")
+    result = cache_get(key)
+    if not result or result.get("blocked"):
+        loop = asyncio.get_running_loop()
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: extract_sync(page_url)), timeout=max(EXTRACT_TIMEOUT, 5)
+            )
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Could not resolve media: {str(e)[:200]}")
+        if result.get("blocked"):
+            raise HTTPException(status_code=409, detail=result.get("blocked_message", "Extraction blocked"))
+        cache_set(key, result)
+
+    # Pick format
+    headers = dict(result.get("download_headers") or {})
+    if f == "best" or not f:
+        media = result.get("download_url")
+    else:
+        media = None
+        for group in ("video", "audio"):
+            for fmt in result.get("formats", {}).get(group, []):
+                if str(fmt.get("format_id")) == f:
+                    media, headers = fmt["url"], dict(fmt.get("headers") or {})
+                    break
+            if media:
+                break
+        if not media and result.get("download_url"):
+            media = result.get("download_url")
+    if not media:
+        raise HTTPException(status_code=404, detail="Format not found — re-extract the link first")
+
+    # Fetch & stream from THIS instance
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+
+    def _stream():
+        req = urllib.request.Request(media, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+    try:
+        # Probe status/headers with a lightweight request first isn't possible with
+        # urllib streaming; instead we start streaming and let errors surface as 500.
+        out_headers = {
+            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
+            "Cache-Control": "no-store",
+        }
+        if range_header:
+            out_headers["Accept-Ranges"] = "bytes"
+        return StreamingResponse(_stream(), media_type="application/octet-stream", headers=out_headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Media fetch failed: {str(e)[:200]}")
 
 
 if __name__ == "__main__":
