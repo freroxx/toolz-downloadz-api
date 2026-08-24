@@ -42,7 +42,7 @@ COOKIES_KV_KEY = "toolz:yt_cookies"
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -367,19 +367,24 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         cf = _cookies_file(yt_ck["content"], "yt_cookies.txt") if yt_ck["content"] else None
         if cf:
             opts["cookiefile"] = cf
+        # Vercel has no ffmpeg → NEVER select merge-pairs ("bv*+ba"); yt-dlp
+        # silently skips merge candidates and errors "format not available".
+        # Single-file selectors only; progressive (A/V in one file) preferred.
         if POT_PROVIDER_URL:
             # PO-token provider (bgutil) — modern cookie-free YouTube bypass.
-            # POT responses are DASH-only (no combined streams), so select the
-            # merge-pair to validate; individual video/audio URLs are served
-            # separately by /api/download (UI already lists them apart).
-            opts["format"] = custom_format or ("bestaudio/best" if audio_only else "bestvideo*+bestaudio/best")
+            opts["format"] = custom_format or (
+                "bestaudio/best" if audio_only
+                else "best[vcodec!=none][acodec!=none]/best")
             opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": POT_PROVIDER_URL}
         else:
-            opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best[ext=mp4]/best")
+            opts["format"] = custom_format or (
+                "bestaudio/best" if audio_only
+                else "best[vcodec!=none][acodec!=none][ext=mp4]/best[vcodec!=none][acodec!=none]/best")
             opts["youtube_include_dash_manifest"] = False
             opts["youtube_include_hls_manifest"] = False
-            if yt_clients:
-                opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
+        # Client pinning works with or without POT (plugin mints per-client)
+        if yt_clients:
+            opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
     elif platform == "tiktok":
         # NOTE: no api_hostname override — defaults are what currently work
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
@@ -559,7 +564,10 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                     POT_PROVIDER_URL.rstrip("/") + "/ping", headers={"User-Agent": UA}), timeout=8)
             except Exception:
                 pass
-        for clients in YT_CLIENT_STRATEGIES:
+        # With POT: try default clients first, then ios/android which often
+        # expose progressive (A/V combined) streams even on DASH-only sessions.
+        attempts = [None, ["ios"], ["android"]] if POT_PROVIDER_URL else YT_CLIENT_STRATEGIES
+        for clients in attempts:
             try:
                 return shape(platform, run_ydl(ydl_opts("youtube", audio_only, custom_format, clients), url), url)
             except Exception as e:
