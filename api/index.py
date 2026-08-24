@@ -9,6 +9,9 @@ Run locally:  uvicorn api.index:app --reload   (or: python api/index.py)
 """
 import os
 import re
+import sys
+import glob
+import shutil
 import time
 import json
 import asyncio
@@ -40,6 +43,25 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 KV_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or "").strip()
 KV_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or "").strip()
 COOKIES_KV_KEY = "toolz:yt_cookies"
+
+
+def _find_node_dir() -> Optional[str]:
+    """Locate the node binary (nodejs-wheel-binaries installs one on Vercel)."""
+    p = shutil.which("node")
+    if p:
+        return os.path.dirname(p)
+    cands = ["/tmp/_vc_deps/bin/node"]
+    for sp in list(sys.path) + [os.getcwd()]:
+        cands += glob.glob(os.path.join(sp, "nodejs_wheel", "bin", "node"))
+        cands += glob.glob(os.path.join(sp, "nodejs-wheel-binaries", "**", "node"), recursive=True)
+        cands += glob.glob(os.path.join(sp, "bin", "node"))
+    for c in cands:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.dirname(c)
+    return None
+
+
+NODE_DIR = _find_node_dir()
 
 
 def _pot_plugin_installed() -> bool:
@@ -408,6 +430,11 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         "http_headers": BASE_HEADERS,
         "extractor_args": {},
     }
+    # EJS: let yt-dlp solve BotGuard/JS challenges with the bundled node
+    # (nodejs-wheel-binaries ships node inside the Vercel deps venv).
+    if NODE_DIR:
+        opts["js_runtimes"] = ["deno", f"node:{NODE_DIR}"]
+        opts["remote_components"] = ["ejs:npm", "ejs:github"]
     if platform == "youtube":
         yt_ck = get_youtube_cookies()
         cf = _cookies_file(yt_ck["content"], "yt_cookies.txt") if yt_ck["content"] else None

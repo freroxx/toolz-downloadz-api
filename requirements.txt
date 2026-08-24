@@ -4,3 +4,6 @@ uvicorn>=0.30.0
 yt-dlp>=2025.6.9
 pytubefix>=6.0.0
 python-dotenv>=1.0.1
+# EJS challenge solving (yt-dlp native BotGuard) + node runtime for it
+yt-dlp-ejs>=0.8
+nodejs-wheel-binaries>=24
