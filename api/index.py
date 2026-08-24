@@ -433,7 +433,7 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
     # EJS: let yt-dlp solve BotGuard/JS challenges with the bundled node
     # (nodejs-wheel-binaries ships node inside the Vercel deps venv).
     if NODE_DIR:
-        opts["js_runtimes"] = ["deno", f"node:{NODE_DIR}"]
+        opts["js_runtimes"] = {"deno": {}, "node": {"path": os.path.join(NODE_DIR, "node")}}
         opts["remote_components"] = ["ejs:npm", "ejs:github"]
     if platform == "youtube":
         yt_ck = get_youtube_cookies()
