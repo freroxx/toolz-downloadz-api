@@ -70,8 +70,8 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(health_router.router, prefix="/api", tags=["health"])
 app.include_router(extract_router.router, prefix="/api", tags=["extract"])
 
-# Convenience aliases without /api prefix for self-host (e.g. /health, /extract)
-# We add thin wrappers instead of duplicate router to avoid operationId collisions.
+# Convenience aliases without /api prefix (e.g. /health, /extract)
+# Thin wrappers to avoid duplicate operationId collisions.
 from fastapi import Depends
 
 @app.get("/health", include_in_schema=False)

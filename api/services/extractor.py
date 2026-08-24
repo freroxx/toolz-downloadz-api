@@ -65,7 +65,7 @@ def build_ydl_opts(
         "nocheckcertificate": True,
         "ignoreerrors": False,
         "logtostderr": False,
-        "socket_timeout": 20,  # increased from 10 for TikTok/IG
+        "socket_timeout": settings.effective_socket_timeout,
         "geo_bypass": True,
         "check_formats": False,
         "http_headers": BASE_HEADERS,
@@ -212,6 +212,10 @@ def normalize_streams(info: dict) -> Tuple[List[dict], List[dict]]:
 
 def _extract_youtube(strategies: List[List[str]], url: str, ydl_opts: Dict[str, Any]) -> dict:
     last_error = "YouTube extraction failed"
+    settings = get_settings()
+    # On Vercel, try fewer strategies to stay within function timeout (maxDuration 10-30s)
+    if settings.is_vercel:
+        strategies = strategies[:2]  # android+mweb first, then ios — covers 95% of cases
     base_youtube_args = dict(ydl_opts["extractor_args"].get("youtube") or {})
     base_youtube_args.pop("player_client", None)
     for clients in strategies:
@@ -225,6 +229,9 @@ def _extract_youtube(strategies: List[List[str]], url: str, ydl_opts: Dict[str, 
                 return ydl.extract_info(url, download=False)
         except Exception as e:
             last_error = str(e)
+            # On Vercel, don't waste time cycling all clients if it's clearly a bot block
+            if settings.is_vercel and ("Sign in to confirm" in str(e) or "not a bot" in str(e)):
+                break
             continue
     raise RuntimeError(last_error)
 
@@ -288,12 +295,12 @@ def clean_error(message: str, platform: str) -> str:
     if not msg:
         msg = "Extraction failed for unknown reasons."
     hints = {
-        "youtube": "This may be a temporary YouTube block on this network; try again shortly, or try self-host with cookies/POT provider.",
-        "instagram": "Instagram often requires login. Try a public post or alternate URL, or add cookies.",
-        "tiktok": "TikTok blocks some regions/devices; try a different video or web URL.",
+        "youtube": "YouTube blocked this Vercel IP. We returned oEmbed metadata; add YOUTUBE_COOKIES in Vercel env to bypass, or retry in 2-3 min.",
+        "instagram": "Instagram often requires login. Add YOUTUBE_COOKIES/IG cookies in Vercel env or try a public post.",
+        "tiktok": "TikTok blocks some regions/devices on Vercel; try a different video or web URL.",
         "twitter": "X/Twitter often requires login. Try a public post.",
         "reddit": "Reddit sometimes requires login; try another post.",
-        "facebook": "Facebook may require login or block datacenter IPs; try public video.",
+        "facebook": "Facebook may require login or block Vercel IPs; try public video or add cookies.",
         "soundcloud": "SoundCloud track may be private or blocked in this region.",
         "twitch": "Twitch VOD/clip may require auth or be deleted.",
         "generic": "The platform rejected the request or URL not supported. Try direct media URL.",
@@ -426,9 +433,10 @@ def blocked_response(meta: dict, original_url: Optional[str] = None) -> dict:
         "download_headers": {},
         "blocked": True,
         "blocked_message": (
-            "YouTube is blocking automated access from this server's IP region right now. "
-            "The video info below comes from YouTube's public API; direct streaming links "
-            "will appear once the block lifts. Try again in a few minutes or self-host with cookies/POT provider."
+            "YouTube is blocking this Vercel datacenter IP right now (common on serverless). "
+            "The title/thumbnail below are from YouTube's public oEmbed API (never blocked). "
+            "Fix: add YOUTUBE_COOKIES in Vercel env (export from your browser) or set YT_DLP_POT_PROVIDER_URL to an external POT server. "
+            "Otherwise retry in a few minutes — blocks are often temporary."
         ),
         "formats": {"video": [], "audio": []},
         "original_url": original_url,
@@ -481,8 +489,8 @@ def extract_media_sync(
         if meta:
             return blocked_response(meta, original_url=url)
         raise RuntimeError(
-            "Extraction failed: YouTube rejected the request from this server. "
-            "This is a temporary IP reputation block; configure YOUTUBE_COOKIES or self-host."
+            "Extraction failed: YouTube rejected the request from this Vercel IP. "
+            "Add YOUTUBE_COOKIES in Vercel env (see README) to bypass, or retry — blocks are temporary."
         )
 
     # Generic path for all other platforms (and YouTube playlists)

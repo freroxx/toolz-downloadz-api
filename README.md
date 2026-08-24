@@ -1,132 +1,93 @@
-# toolz-downloadz-api
+# toolz-downloadz-api — Vercel Serverless Only
 
-Lightweight, production-ready FastAPI backend optimized for Vercel Serverless. Powering cross-platform media extraction for the Toolz ecosystem using `yt-dlp`.
+Lightweight, production-ready FastAPI backend for Vercel Functions. Powering cross-platform media extraction for the Toolz ecosystem using `yt-dlp`.
+
+> **Vercel-only mode**: This API is designed to run *exclusively* on Vercel (no Docker, no VPS). All infra — cache, rate-limit, POT bypass — is adapted for serverless.
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fyour-username%2Ftoolz-downloadz-api&env=API_SECRET_KEY)
 
-## Features
+## Features (v2.0)
 
-- **Serverless Ready**: Designed to run on Vercel Functions with zero disk writes.
-- **FastAPI**: High-performance Python backend with automatic OpenAPI documentation.
-- **Secure**: Protected by `X-API-KEY` header authentication.
-- **Bot-Resistant**: Multi-client rotation for YouTube plus a never-blocked oEmbed
-  metadata fallback; optional cookie file support for datacenter IP blocks.
-- **CORS Enabled**: Ready for connection from Android apps, Web UIs, and CLI tools.
+- **Vercel Serverless Native**: `vercel.json` `functions.maxDuration=30`, `/tmp` cookie write, `memory + Upstash Redis REST` cache, `asyncio.wait_for` timeout guard.
+- **FastAPI + OpenAPI**: Auto docs at `/docs`, strict `pydantic` validation, `X-API-KEY` *or* `Authorization: Bearer`.
+- **Secure**: SSRF block (private IPs), CORS via `CORS_ORIGINS`, `slowapi` rate-limit (`30/min` extract).
+- **Resilient on Vercel**: YouTube bot-block handling (see below), never-blocked oEmbed fallback, optional `YOUTUBE_COOKIES` bypass.
+- **Production Observability**: Request logging with `X-Request-ID`, `/api/health`, `X-Cache` headers, optional Sentry.
 
-## Platform Support & Resilience
+## Platform Support & Vercel Resilience
 
-`yt-dlp` runs against a datacenter IP on hosting platforms, and YouTube (and
-sometimes Instagram/Reddit) will flag it with *"Sign in to confirm you're not a
-bot."* This API handles that with three layers:
+Vercel = datacenter IP → YouTube often returns *Sign in to confirm you're not a bot*. This API handles it in **Vercel-optimized** 3 layers:
 
-1. **Client rotation** – YouTube is tried with several player clients
-   (`android`, `mweb`, `web_safari`, `ios`, `web`, `tv`, `android_vr`) until one
-   succeeds.
-2. **oEmbed fallback** – if YouTube blocks the extractor, metadata (title,
-   thumbnail, uploader) is still returned from YouTube's public oEmbed endpoint,
-   which is never blocked. The client sees a `blocked: true` card with an
-   *Open on source* action instead of a hard failure.
-3. **Optional cookie auth** – set `YOUTUBE_COOKIES` (Netscape format exported
-   from a browser) to authenticate and bypass the block entirely. Never keep
-   using that browser session after exporting.
-4. **PO Token provider (strongest)** – run the
-   [bgutil POT provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
-   (Docker image `brainicism/bgutil-ytdlp-pot-provider`, or Node/Deno) alongside
-   this app and set `YT_DLP_POT_PROVIDER_URL` to its URL. The plugin
-   (`bgutil-ytdlp-pot-provider`, pinned in `requirements.txt`) is auto-detected
-   on `http://127.0.0.1:4416`, but a custom `base_url` is passed through via
-   extractor args. Requires a Node/Deno-capable host (e.g. self-host), not
-   Vercel serverless.
+1. **Client rotation (Vercel-tuned)** – Tries `android,mweb` then `ios` only (2 strategies, not 4) to stay inside Vercel function timeout. `api/services/extractor.py:213`
+2. **oEmbed fallback** – If blocked, returns YouTube's public oEmbed metadata (`title/thumbnail/uploader`) which is *never* blocked. Client sees `blocked: true` card with `Open on source`. `api/services/extractor.py:147`
+3. **Cookie auth (recommended on Vercel)** – Set `YOUTUBE_COOKIES` (Netscape `cookies.txt` content exported from your browser) in **Vercel Env**. This is the *only* reliable Vercel fix; datacenter blocks disappear. `api/services/extractor.py:27` writes to `/tmp/yt_cookies.txt` (writable on Vercel).
+4. **External POT provider (optional)** – Vercel cannot run `bgutil` alongside Python (needs Node). If you host `brainicism/bgutil-ytdlp-pot-provider` elsewhere, set `YT_DLP_POT_PROVIDER_URL=https://pot.yourdomain.com` to enable real PO token bypass externally.
 
-### Self-hosting for maximum success
+**Vercel Timeout Guard**: `EXTRACT_TIMEOUT` capped at `9s` on Vercel hobby to avoid `504`. `api/routers/extract.py:13` uses `asyncio.wait_for`.
 
-Serverless datacenter IPs are the #1 trigger for bot blocks. For the most
-reliable behavior, run the same code on a persistent VPS/residential IP, and if
-YouTube still blocks, add the POT provider:
+**Cache on Vercel**: In-memory per-lambda + optional **Upstash Redis REST / Vercel KV** for cross-lambda persistence. `api/core/cache.py:1`
+- Create Vercel Storage → KV (Upstash) → Connect to project → auto-sets `KV_REST_API_URL` + `KV_REST_API_TOKEN` (or `UPSTASH_REDIS_REST_URL`).
+- If not set, cache gracefully degrades to memory.
+
+## Setup — Vercel Deploy
+
+1. Push to GitHub.
+2. Import project in [Vercel Dashboard](https://vercel.com/new) — auto-detects `vercel.json`.
+3. **Environment Variables** (Settings → Environment Variables):
+   - `API_SECRET_KEY` (required, `openssl rand -hex 32`)
+   - `YOUTUBE_COOKIES` (recommended — paste full `cookies.txt`)
+   - `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` *or* `KV_*` (auto-set if you added Vercel KV)
+   - `CORS_ORIGINS` (e.g. `https://toolz-downloadz.vercel.app`)
+4. Deploy. Vercel routes `/api/(.*)` → `api/index.py`. No Docker needed.
+
+### Local Dev (still runs via Vercel's Python runtime, but you can also run locally)
 
 ```bash
-docker build -t toolz-downloadz-api .
-docker run --rm -p 8000:8000 -e API_SECRET_KEY=your_key toolz-downloadz-api
+pip install -r requirements.txt --break-system-packages
+cp .env.example .env  # set API_SECRET_KEY
+python api/index.py  # or uvicorn api.main:app --reload
+# http://localhost:8000/docs
 ```
-
-To run the PO-Origin token server alongside the API on one host:
-
-```bash
-docker run --name bgutil-provider -d --init \
-  brainicism/bgutil-ytdlp-pot-provider
-# provider listens on http://127.0.0.1:4416 by default — the plugin finds it
-# automatically, no env var needed. For a custom URL set:
-docker run --rm -p 8000:8000 \
-  -e API_SECRET_KEY=your_key \
-  -e YT_DLP_POT_PROVIDER_URL=http://127.0.0.1:4416 toolz-downloadz-api
-```
-
-## Setup & Local Development
-
-### Prerequisites
-
-- Python 3.11+
-- Pip (Python Package Manager)
-
-### Installation
-
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/your-username/toolz-downloadz-api.git
-   cd toolz-downloadz-api
-   ```
-
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Configure Environment Variables:**
-   Copy `.env.example` to `.env` and set your secret key:
-   ```bash
-   cp .env.example .env
-   ```
-
-4. **Run the development server:**
-   ```bash
-   python api/index.py
-   ```
-   The API will be available at `http://localhost:8000`.
 
 ## API Documentation
 
-Once running, you can access the interactive Swagger UI at `http://localhost:8000/docs`.
+Swagger UI: `http://localhost:8000/docs` (or `https://your-api.vercel.app/docs`)
 
-### Endpoint: `GET /api/extract`
+### `GET /api/extract`
 
-Extracts metadata and direct stream URLs for a given media URL.
+**Headers:** `X-API-KEY: <secret>` or `Authorization: Bearer <secret>`
 
-**Headers:**
-- `X-API-KEY`: Your secret key (must match `API_SECRET_KEY`).
+**Query:** `url` (required), `format` (yt-dlp selector), `audio_only` (bool), `playlist` (bool), `subtitles` (bool)
 
-**Query Parameters:**
-- `url` (string, required): The URL of the video/audio to extract.
-
-**Response Schema:**
-```json
-{
-  "title": "Video Title",
-  "thumbnail": "https://cdn.example.com/thumb.jpg",
-  "duration": 120,
-  "uploader": "Channel Name",
-  "download_url": "https://direct-stream-url.com/...",
-  "ext": "mp4",
-  "formats": [...]
-}
+**Example:**
+```bash
+curl "https://your-api.vercel.app/api/extract?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ" -H "X-API-KEY: $API_SECRET_KEY"
 ```
 
-## Deployment on Vercel
+**Response:**
+```json
+{
+  "platform": "youtube",
+  "title": "Video Title",
+  "thumbnail": "https://...",
+  "duration": 120,
+  "uploader": "Channel",
+  "download_url": "https://...",
+  "ext": "mp4",
+  "blocked": false,
+  "formats": {"video": [...], "audio": [...]},
+  "subtitles": {...},
+  "playlist_entries": [...]
+}
+```
+If YouTube blocked on Vercel IP: `blocked:true` + `blocked_message` + oEmbed `title/thumbnail` — set `YOUTUBE_COOKIES` to fix.
 
-1. Push this repository to GitHub/GitLab/Bitbucket.
-2. Connect your repository to [Vercel](https://vercel.com).
-3. Set the `API_SECRET_KEY` Environment Variable in the Vercel Dashboard.
-4. Deploy! Vercel will automatically detect the Python configuration and route `/api/*` to `api/index.py`.
+Other endpoints: `GET /api/platforms`, `GET /api/detect?url=`, `POST /api/extract` (JSON body), `GET /api/health`.
+
+## Web Tester
+
+The companion `toolz-downloadz` Next.js app is a full tester harness: Tester panel exposes `audio_only/playlist/subtitles/format`, `curl` preview, `/api/health` badge, raw JSON. Set `API_URL` to your Vercel API URL in `toolz-downloadz/.env`.
 
 ## License
 
-This project is licensed under the **GNU GPLv3** - see the [LICENSE](LICENSE) file for details.
+GNU GPLv3 — see LICENSE.
