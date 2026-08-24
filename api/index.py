@@ -32,6 +32,13 @@ API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
 POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv("POT_PROVIDER_URL", "").strip()
+
+# Hot-reloadable cookie store (Upstash Redis REST / Vercel KV).
+# Precedence: KV value (if set) > YOUTUBE_COOKIES env. Lets you refresh
+# cookies via POST /api/admin/cookies without a redeploy.
+KV_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or "").strip()
+KV_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or "").strip()
+COOKIES_KV_KEY = "toolz:yt_cookies"
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
