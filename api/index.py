@@ -31,6 +31,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
+POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv("POT_PROVIDER_URL", "").strip()
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
@@ -229,9 +230,12 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best[ext=mp4]/best")
         opts["youtube_include_dash_manifest"] = False
         opts["youtube_include_hls_manifest"] = False
-        # Only pin clients when explicitly requested; with cookies, yt-dlp defaults
-        # + cookies beat any hardcoded rotation
-        if yt_clients:
+        if POT_PROVIDER_URL:
+            # PO-token provider (bgutil) — the modern cookie-free YouTube bypass.
+            # Plugin (bgutil-ytdlp-pot-provider, in requirements.txt) calls it automatically;
+            # with POT active we let yt-dlp pick PO-capable clients (no forced rotation).
+            opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": POT_PROVIDER_URL}
+        elif yt_clients:
             opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
     elif platform == "tiktok":
         # NOTE: no api_hostname override — defaults are what currently work
