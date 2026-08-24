@@ -35,7 +35,7 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.2.1"
+VERSION = "3.2.2"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -409,6 +409,15 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
 
     if platform == "youtube":
         last = None
+        # Warm the POT provider (cold boot + BotGuard init can take 5-10s;
+        # the plugin's own HTTP timeout is shorter than that). We're already
+        # inside an executor thread here, so blocking is fine.
+        if POT_PROVIDER_URL:
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    POT_PROVIDER_URL.rstrip("/") + "/ping", headers={"User-Agent": UA}), timeout=8)
+            except Exception:
+                pass
         for clients in YT_CLIENT_STRATEGIES:
             try:
                 return shape(platform, run_ydl(ydl_opts("youtube", audio_only, custom_format, clients), url), url)
@@ -423,7 +432,11 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
             return alt
         meta = youtube_oembed(url)
         if meta:
-            return blocked_shape("youtube", meta, url, BLOCK_MSGS["youtube"])
+            diag = (last or "unknown")[:180]
+            return blocked_shape(
+                "youtube", meta, url,
+                BLOCK_MSGS["youtube"] + f"\n\n[diag: {diag} | pot={'on' if POT_PROVIDER_URL else 'off'} | cookies={'on' if YOUTUBE_COOKIES else 'off'}]",
+            )
         raise RuntimeError(f"YouTube extraction failed: {(last or 'unknown')[:300]}")
 
     if platform == "tiktok":
@@ -620,121 +633,126 @@ async def download(
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL")
 
-    # Resolve media URL. Attempt 0 uses cache (instant); on expired/403 links we
-    # re-extract FRESH signatures once and retry before giving up.
+    # Resolve + stream via explicit strategy chain. Each strategy is one
+    # (resolve-mode, media-source) combo; first successful open wins.
     range_header = request.headers.get("range")
-    last_err = None
+    errors: List[str] = []
+    resp = None
 
-    for attempt in range(2):
+    async def _resolve(fresh: bool) -> dict:
         key = _ckey(page_url, "False|None")
-        result = cache_get(key) if attempt == 0 else None
+        result = None if fresh else cache_get(key)
         if not result or result.get("blocked"):
             loop = asyncio.get_running_loop()
             try:
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: extract_sync(page_url)), timeout=max(EXTRACT_TIMEOUT, 5)
+                    loop.run_in_executor(None, lambda: extract_sync(page_url)),
+                    timeout=max(EXTRACT_TIMEOUT, 5),
                 )
             except asyncio.TimeoutError:
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"Preparing the download timed out (~{EXTRACT_TIMEOUT}s). Tap Download once more — retries are faster and usually succeed.",
-                )
+                raise HTTPException(504, f"Preparing the download timed out (~{EXTRACT_TIMEOUT}s). Tap Download once more — retries usually succeed.")
             except HTTPException:
                 raise
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Could not resolve media: {str(e)[:200]}")
             if result.get("blocked"):
-                raise HTTPException(status_code=409, detail=result.get("blocked_message", "Extraction blocked"))
+                raise HTTPException(409, result.get("blocked_message", "Extraction blocked"))
             cache_set(key, result)
+        return result
 
-        # Pick format
+    def _pick(result):
         headers = dict(result.get("download_headers") or {})
-        fmt_cookies = None
-        if f == "best" or not f:
-            media = result.get("download_url")
-            fmt_cookies = result.get("download_cookies")  # its OWN cookies (token pairing)
-        else:
-            media = None
+        cookies = result.get("download_cookies")
+        if f != "best" and f:
             for group in ("video", "audio"):
                 for fmt in result.get("formats", {}).get(group, []):
                     if str(fmt.get("format_id")) == f:
-                        media, headers = fmt["url"], dict(fmt.get("headers") or {})
-                        fmt_cookies = fmt.get("cookies")
-                        break
-                if media:
-                    break
-            if not media and result.get("download_url"):
-                media = result.get("download_url")
-                fmt_cookies = result.get("download_cookies")
-        if not media:
-            raise HTTPException(status_code=404, detail="Format not found — re-extract the link first")
+                        return fmt["url"], dict(fmt.get("headers") or {}), fmt.get("cookies")
+        media = result.get("download_url")
+        if media and not headers:
+            vids = result.get("formats", {}).get("video") or []
+            if vids:
+                headers = dict(vids[0].get("headers") or {})
+        return media, headers, cookies
 
-        if fmt_cookies:
-            headers["Cookie"] = fmt_cookies
+    def _sync_open(media_url, h):
+        req = urllib.request.Request(media_url, headers=h)
+        return urllib.request.urlopen(req, timeout=25)
+
+    def _h_with_range(h):
+        h2 = dict(h)
         if range_header:
-            headers["Range"] = range_header
+            h2["Range"] = range_header
+        return h2
 
-        def _open(extra=None):
-            h = dict(headers)
-            if extra:
-                h.update(extra)
-            req = urllib.request.Request(media, headers=h)
-            return urllib.request.urlopen(req, timeout=20)
-
+    strategies = [("cached", False), ("fresh", True)]
+    for label, fresh in strategies:
         try:
-            try:
-                resp = _open()
-            except urllib.error.HTTPError as e:
-                if e.code in (403, 410) and attempt == 0:
-                    last_err = f"{e.code}"
-                    # TikTok special-case: yt-dlp URLs can be CDN-IP-rejected even
-                    # when fresh. tikwm's CDN is IP-free — mint a link there instead.
-                    if platform == "tiktok":
-                        alt = tiktok_tikwm(page_url)
-                        if alt and alt.get("download_url"):
-                            media = alt["download_url"]
-                            headers = dict(alt.get("download_headers") or {})
-                            fmt_cookies = None
-                            continue
-                    continue  # otherwise signature expired → fresh extract + retry
-                resp = _open({"Range": "bytes=0-"})  # some CDNs require explicit Range
+            result = await _resolve(fresh)
+        except HTTPException as he:
+            if he.status_code == 409 or label == "fresh":
+                raise
+            errors.append(str(he.detail)[:100])
+            continue
+        media, hdrs, cookies = _pick(result)
+        if not media:
+            continue
+        h = dict(hdrs)
+        if cookies:
+            h["Cookie"] = cookies
+        try:
+            resp = _sync_open(media, _h_with_range(h))
         except urllib.error.HTTPError as e:
-            if attempt == 0:
-                last_err = str(e.code)
-                continue
-            raise HTTPException(status_code=502,
-                                detail=f"Media source refused ({e.code}). Link expired — extract again.")
-        except Exception as e:
-            if attempt == 0:
-                last_err = str(e)
-                continue
-            raise HTTPException(status_code=502, detail=f"Media fetch failed: {str(e)[:200]}")
-
-        def _iter(r):
-            try:
-                while True:
-                    chunk = r.read(65536)
-                    if not chunk:
+            errors.append(f"{label}:{e.code}")
+            # TikTok: yt-dlp CDN URLs can be IP-rejected even when fresh —
+            # tikwm's CDN is IP-free. Always available as last resort.
+            if platform == "tiktok" and e.code in (403, 410):
+                alt = tiktok_tikwm(page_url)
+                if alt and alt.get("download_url"):
+                    try:
+                        resp = _sync_open(alt["download_url"], dict(alt.get("download_headers") or {}))
                         break
-                    yield chunk
-            finally:
-                r.close()
+                    except Exception as e2:
+                        errors.append(f"tikwm:{str(getattr(e2, 'code', e2))[:40]}")
+            # Some CDNs require an explicit Range; retry before moving on
+            try:
+                resp = _sync_open(media, {**_h_with_range(h), "Range": "bytes=0-"})
+                break
+            except Exception as e2:
+                errors.append(str(getattr(e2, "code", e2))[:40])
+                continue
+        except Exception as e:
+            errors.append(str(e)[:80])
+            continue
+        break
 
-        out_headers = {
-            "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
-            "Cache-Control": "no-store",
-            "Accept-Ranges": "bytes",
-        }
-        for k in ("Content-Length", "Content-Range", "Content-Type"):
-            v = resp.headers.get(k)
-            if v:
-                out_headers[k] = v
-        status = 206 if resp.status == 206 else 200
-        return StreamingResponse(_iter(resp), status_code=status,
-                                 media_type=resp.headers.get("Content-Type", "application/octet-stream"),
-                                 headers=out_headers)
+    if resp is None:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Media source refused ({'; '.join(errors[-3:])}). Extract again.",
+        )
 
-    raise HTTPException(status_code=502, detail=f"Media source refused ({last_err}). Extract again.")
+    def _iter(r):
+        try:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            r.close()
+
+    out_headers = {
+        "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(n))}",
+        "Cache-Control": "no-store",
+        "Accept-Ranges": "bytes",
+    }
+    for k in ("Content-Length", "Content-Range", "Content-Type"):
+        v = resp.headers.get(k)
+        if v:
+            out_headers[k] = v
+    status = 206 if resp.status == 206 else 200
+    return StreamingResponse(_iter(resp), status_code=status,
+                             media_type=resp.headers.get("Content-Type", "application/octet-stream"),
+                             headers=out_headers)
 
 
 if __name__ == "__main__":
