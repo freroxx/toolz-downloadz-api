@@ -35,7 +35,7 @@ POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -687,7 +687,16 @@ async def download(
             except urllib.error.HTTPError as e:
                 if e.code in (403, 410) and attempt == 0:
                     last_err = f"{e.code}"
-                    continue  # signature likely expired → fresh extract + retry
+                    # TikTok special-case: yt-dlp URLs can be CDN-IP-rejected even
+                    # when fresh. tikwm's CDN is IP-free — mint a link there instead.
+                    if platform == "tiktok":
+                        alt = tiktok_tikwm(page_url)
+                        if alt and alt.get("download_url"):
+                            media = alt["download_url"]
+                            headers = dict(alt.get("download_headers") or {})
+                            fmt_cookies = None
+                            continue
+                    continue  # otherwise signature expired → fresh extract + retry
                 resp = _open({"Range": "bytes=0-"})  # some CDNs require explicit Range
         except urllib.error.HTTPError as e:
             if attempt == 0:
