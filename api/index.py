@@ -34,7 +34,7 @@ INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -44,8 +44,9 @@ SUPPORTED = ["youtube", "tiktok", "instagram"]
 
 # None = don't override player_client at all (yt-dlp defaults — best when cookies are set)
 YT_CLIENT_STRATEGIES = [
-    ["tv", "web_safari"],
+    ["tv_simply", "tv", "web_safari"],
     ["android", "ios"],
+    ["web_embedded"],
     None,
 ]
 
@@ -148,6 +149,61 @@ def youtube_oembed(url: str) -> Optional[dict]:
 
 def tiktok_oembed(url: str) -> Optional[dict]:
     return _oembed("https://www.tiktok.com/oembed?url=" + urllib.parse.quote(tiktok_canonical(url), safe=""))
+
+
+def tiktok_tikwm(url: str) -> Optional[dict]:
+    """
+    Cookie-free TikTok engine via the public tikwm.com API.
+    Returns no-watermark HD links hosted on tikwm's CDN — NOT IP-bound, so both
+    extraction and same-instance download work from anywhere (incl. Vercel).
+    """
+    try:
+        api = "https://www.tikwm.com/api/?hd=1&url=" + urllib.parse.quote(tiktok_canonical(url), safe="")
+        req = urllib.request.Request(api, headers=BASE_HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        if data.get("code") != 0 or not data.get("data"):
+            return None
+        d = data["data"]
+        media = d.get("hdplay") or d.get("play") or d.get("wmplay")
+        if not media:
+            return None
+        video = [{"format_id": "tikwm_hd" if d.get("hdplay") else "tikwm_sd",
+                  "ext": "mp4", "resolution": "1080p no-watermark" if d.get("hdplay") else "SD no-watermark",
+                  "url": media, "filesize": None, "vcodec": "avc1", "acodec": "mp4a",
+                  "height": 1920 if d.get("hdplay") else None, "tbr": None, "abr": None,
+                  "headers": dict(BASE_HEADERS), "cookies": None}]
+        audio = []
+        if d.get("music"):
+            audio.append({"format_id": "tikwm_music", "ext": "mp3", "resolution": "audio",
+                          "url": d["music"], "filesize": None, "vcodec": "none", "acodec": "mp3",
+                          "height": None, "tbr": None, "abr": None,
+                          "headers": dict(BASE_HEADERS), "cookies": None})
+        author = d.get("author") or {}
+        stats_src = d
+        def _g(k):
+            v = stats_src.get(k)
+            try:
+                return int(v) if v is not None else None
+            except Exception:
+                return None
+        return {
+            "platform": "tiktok",
+            "title": d.get("title"),
+            "thumbnail": d.get("cover") or d.get("origin_cover"),
+            "duration": d.get("duration"),
+            "uploader": author.get("nickname"),
+            "uploader_url": f"https://www.tiktok.com/@{author.get('unique_id')}" if author.get("unique_id") else None,
+            "stats": {"view_count": _g("play_count"), "like_count": _g("digg_count"),
+                      "comment_count": _g("comment_count")},
+            "upload_date": None, "description": None,
+            "download_url": media, "download_headers": dict(BASE_HEADERS),
+            "ext": "mp4", "blocked": False, "source": "tikwm",
+            "formats": {"video": video, "audio": audio},
+            "original_url": url,
+        }
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -360,6 +416,10 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 except Exception as e:
                     last = str(e)
             time.sleep(0.8)
+        # Cookie-free community engine — works even when TikTok flags our IP
+        alt = tiktok_tikwm(url)
+        if alt:
+            return alt
         meta = tiktok_oembed(url)
         if meta:
             return blocked_shape("tiktok", meta, url, BLOCK_MSGS["tiktok"])
