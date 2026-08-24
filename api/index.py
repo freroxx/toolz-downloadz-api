@@ -270,6 +270,14 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
             dl, hdrs = pick[0]["url"], dict(pick[0]["headers"] or {})
     stats = {k: info.get(k) for k in
              ("view_count", "like_count", "comment_count")}
+    # Pair the chosen download_url with ITS OWN cookies (TikTok tt_chain_token
+    # must match the ?tk= param inside that exact URL or CDN returns 403)
+    dl_cookies = None
+    if dl:
+        for f_ in info.get("formats") or []:
+            if f_.get("url") == dl and f_.get("cookies"):
+                dl_cookies = f_["cookies"]
+                break
     return {
         "platform": platform,
         "title": info.get("title"),
@@ -282,6 +290,7 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
         "description": (info.get("description") or "")[:400] or None,
         "download_url": dl,
         "download_headers": hdrs,
+        "download_cookies": dl_cookies,
         "ext": info.get("ext"),
         "blocked": False,
         "formats": {"video": video[:20], "audio": audio[:10]},
@@ -541,35 +550,28 @@ async def download(
 
     # Pick format
     headers = dict(result.get("download_headers") or {})
+    fmt_cookies = None
     if f == "best" or not f:
         media = result.get("download_url")
-        if not headers and result.get("formats", {}).get("video"):
-            headers = dict(result["formats"]["video"][0].get("headers") or {})
+        # Its OWN cookies — never borrow from another format (token pairing)
+        fmt_cookies = result.get("download_cookies")
     else:
         media = None
         for group in ("video", "audio"):
             for fmt in result.get("formats", {}).get(group, []):
                 if str(fmt.get("format_id")) == f:
                     media, headers = fmt["url"], dict(fmt.get("headers") or {})
+                    fmt_cookies = fmt.get("cookies")
                     break
             if media:
                 break
         if not media and result.get("download_url"):
             media = result.get("download_url")
+            fmt_cookies = result.get("download_cookies")
     if not media:
         raise HTTPException(status_code=404, detail="Format not found — re-extract the link first")
 
-    # Per-format cookies (TikTok ttwid chain token) are REQUIRED or CDN returns empty
-    fmt_cookies = None
-    if f != "best":
-        for group in ("video", "audio"):
-            for fmt in result.get("formats", {}).get(group, []):
-                if str(fmt.get("format_id")) == f:
-                    fmt_cookies = fmt.get("cookies")
-                    break
-    if not fmt_cookies:
-        all_fmts = (result.get("formats", {}).get("video") or []) + (result.get("formats", {}).get("audio") or [])
-        fmt_cookies = next((x.get("cookies") for x in all_fmts if x.get("cookies")), None)
+    # Per-format cookies (TikTok ttwid chain token) are REQUIRED or CDN returns empty/403
     if fmt_cookies:
         headers["Cookie"] = fmt_cookies
 
