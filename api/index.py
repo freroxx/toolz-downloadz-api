@@ -42,7 +42,7 @@ COOKIES_KV_KEY = "toolz:yt_cookies"
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.3.1"
+VERSION = "3.4.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -548,6 +548,7 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         raise ValueError("Unsupported URL. Only YouTube, TikTok and Instagram Reels are supported.")
 
     if platform == "youtube":
+        ck_state = get_youtube_cookies()
         last = None
         # Warm the POT provider (cold boot + BotGuard init can take 5-10s;
         # the plugin's own HTTP timeout is shorter than that). We're already
