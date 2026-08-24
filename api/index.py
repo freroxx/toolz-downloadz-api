@@ -8,6 +8,7 @@ A flat, dependency-free-import file eliminates the NOT_FOUND class of bugs.
 Run locally:  uvicorn api.index:app --reload   (or: python api/index.py)
 """
 import os
+import re
 import time
 import json
 import asyncio
@@ -48,7 +49,7 @@ def _pot_plugin_installed() -> bool:
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "25"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.4.4"
+VERSION = "3.5.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -269,6 +270,45 @@ def detect_platform(url: str) -> Optional[str]:
 
 def tiktok_canonical(url: str) -> str:
     return url.split("?")[0].split("#")[0]
+
+
+def _yt_video_id(url: str) -> Optional[str]:
+    """Extract the 11-char video id from any YouTube URL shape."""
+    p = urllib.parse.urlparse(url)
+    host = (p.hostname or "").replace("www.", "")
+    if host == "youtu.be":
+        vid = p.path.lstrip("/").split("/")[0]
+        return vid or None
+    q = urllib.parse.parse_qs(p.query).get("v")
+    if q:
+        return q[0]
+    parts = [s for s in p.path.split("/") if s]
+    for i, seg in enumerate(parts):
+        if seg in ("shorts", "embed", "v", "live") and i + 1 < len(parts):
+            return parts[i + 1]
+    m = re.search(r"[a-zA-Z0-9_-]{11}", url)
+    return m.group(0) if m else None
+
+
+def _mint_video_bound_token(video_id: str) -> Optional[str]:
+    """
+    Mint a PO token bound to the VIDEO ID via our toolz-pot server.
+    tv-client tokens bound to content (not visitor) are honored regardless of
+    IP reputation — this is the cookie-free Vercel bypass.
+    """
+    if not POT_PROVIDER_URL:
+        return None
+    try:
+        body = json.dumps({"content_binding": video_id, "bypass_cache": True}).encode()
+        req = urllib.request.Request(
+            POT_PROVIDER_URL.rstrip("/") + "/get_pot", data=body,
+            headers={"User-Agent": UA, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        tok = data.get("poToken")
+        return tok or None
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -571,6 +611,21 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         # Full rotation ALWAYS — tv-family first (least bot-walled), plugin
         # mints per-client PO tokens when POT is configured.
         strategy_errors: Dict[str, str] = {}
+        # PRIMARY: tv client + video-ID-bound PO token (IP-reputation-immune)
+        vid = _yt_video_id(url)
+        if POT_PROVIDER_URL and vid:
+            tok = _mint_video_bound_token(vid)
+            if tok:
+                o = ydl_opts("youtube", audio_only, custom_format, ["tv"])
+                ea = o.setdefault("extractor_args", {}).setdefault("youtube", {})
+                ea["po_token"] = [f"tv.player+{tok}"]
+                ea["fetch_pot"] = ["never"]
+                try:
+                    return shape(platform, run_ydl(o, url), url)
+                except Exception as e:
+                    last = str(e)
+                    strategy_errors["tv+videobound"] = last[:120]
+
         for clients in YT_CLIENT_STRATEGIES:
             label = "+".join(clients) if clients else "defaults"
             try:
@@ -726,6 +781,21 @@ async def ytdebug(request: Request, url: str = Query(...)):
     if detect_platform(clean) != "youtube":
         raise HTTPException(status_code=400, detail="Not a YouTube URL")
     results = []
+    vid = _yt_video_id(clean)
+    if POT_PROVIDER_URL and vid:
+        tok = _mint_video_bound_token(vid)
+        if tok:
+            o = ydl_opts("youtube", False, None, ["tv"])
+            ea = o.setdefault("extractor_args", {}).setdefault("youtube", {})
+            ea["po_token"] = [f"tv.player+{tok}"]
+            ea["fetch_pot"] = ["never"]
+            try:
+                info = run_ydl(o, clean)
+                results.append({"strategy": "tv+videobound", "ok": True,
+                                "formats": len((info or {}).get("formats") or [])})
+            except Exception as e:
+                results.append({"strategy": "tv+videobound", "ok": False,
+                                "error": str(e).replace("ERROR: ", "")[:160]})
     for clients in YT_CLIENT_STRATEGIES:
         label = "+".join(clients) if clients else "defaults"
         try:
