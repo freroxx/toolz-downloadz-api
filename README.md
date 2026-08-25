@@ -50,6 +50,18 @@ Vercel IPs get bot-walled; fresh login cookies are the reliable fix.
 1. cron-job.org → Create cronjob → URL: `https://toolz-pot.vercel.app/ping`, every 5 min.
    BotGuard stays initialized → token minting stays fast; also keeps yt-dlp's 5s provider-ping gate happy.
 
+## High-quality YouTube ladder (open-source cobalt)
+
+Vercel IPs are bot-walled by YouTube. The fix: run **your own** instance of the
+open-source [cobalt](https://github.com/imputnet/cobalt) API on a free host and point this API at it:
+
+```
+COBALT_API_URL=https://your-cobalt.example.com
+```
+
+Full click-by-click guide (Render/Koyeb, free): [`deploy/COBALT_FREE_HOSTING.md`](deploy/COBALT_FREE_HOSTING.md).
+Once set, every YouTube extraction exposes 360p→4K + MP3 via your own instance.
+
 ## Local dev
 
 ```bash
