@@ -59,7 +59,7 @@ open-source [cobalt](https://github.com/imputnet/cobalt) API on a free host and 
 COBALT_API_URL=https://your-cobalt.example.com
 ```
 
-Full click-by-click guide (Render/Koyeb, free): [`deploy/COBALT_FREE_HOSTING.md`](deploy/COBALT_FREE_HOSTING.md).
+Full click-by-click guide (Render/Koyeb, free): [`deploy/FREE_HOSTING.md`](deploy/FREE_HOSTING.md).
 Once set, every YouTube extraction exposes 360p→4K + MP3 via your own instance.
 
 ## Local dev
