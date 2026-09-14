@@ -2,7 +2,11 @@
 import os
 os.environ.setdefault("API_SECRET_KEY", "test123")
 
+from types import SimpleNamespace
+
+import pytest
 from fastapi.testclient import TestClient
+from api import index as api
 from api.index import app, detect_platform
 
 c = TestClient(app)
@@ -85,3 +89,102 @@ def test_post_extract():
 def test_audio_only_flag():
     r = c.get("/api/extract", params={"url": TT, "audio_only": "true"}, headers=H)
     assert r.status_code in (200, 504)
+
+
+# --- Offline unit tests (no network) ----------------------------------------
+
+def _tikwm_payload(**over):
+    d = {
+        "id": "7677478472293289247",
+        "title": "Why the friend group yt channel never works",
+        "cover": "https://cdn/cover.jpg",
+        "origin_cover": "https://cdn/origin.jpg",
+        "play": "https://cdn/play.mp4",
+        "hdplay": "https://cdn/hdplay.mp4",
+        "wmplay": "https://cdn/wmplay.mp4",
+        "size": 5421185,
+        "hd_size": 4561873,
+        "wm_size": 5025333,
+        "duration": 32,
+        "create_time": 1750000000,
+        "music": "https://cdn/music.mp3",
+        "play_count": 1000,
+        "digg_count": 50,
+        "comment_count": 5,
+        "author": {"nickname": "carter", "unique_id": "carterpcs"},
+    }
+    d.update(over)
+    return d
+
+
+def test_tikwm_shape_hd_is_honest():
+    out = api._tikwm_shape(_tikwm_payload(), TT)
+    v = out["formats"]["video"][0]
+    assert v["format_id"] == "tikwm_hd"
+    assert v["resolution"].startswith("~")  # approximate tier, never stated as fact
+    assert "1080p" not in v["resolution"] or v["resolution"].startswith("~")
+    assert v["height"] is None and v["vcodec"] is None and v["acodec"] is None
+    assert v["has_audio"] is True
+    assert v["filesize"] == 4561873  # byte count for the exact file served
+    assert out["duration"] == 32
+    assert out["upload_date"] == "20250615"
+    assert out["download_url"] == "https://cdn/hdplay.mp4"
+
+
+def test_tikwm_shape_sd_fallback_size():
+    d = _tikwm_payload(hdplay=None, hd_size=None)
+    out = api._tikwm_shape(d, TT)
+    v = out["formats"]["video"][0]
+    assert v["format_id"] == "tikwm_sd"
+    assert v["filesize"] == 5421185  # matches play, not hd
+    assert out["download_url"] == "https://cdn/play.mp4"
+
+
+def test_tikwm_shape_no_media_returns_none():
+    assert api._tikwm_shape(_tikwm_payload(hdplay=None, play=None, wmplay=None), TT) is None
+
+
+def test_tikwm_audio_only_serves_music():
+    out = api._tikwm_shape(_tikwm_payload(), TT, audio_only=True)
+    assert out["ext"] == "mp3"
+    assert out["download_url"] == "https://cdn/music.mp3"
+    assert out["formats"]["video"] == []
+    assert out["formats"]["audio"][0]["format_id"] == "tikwm_music"
+
+
+def test_tikwm_audio_only_without_music_keeps_video():
+    out = api._tikwm_shape(_tikwm_payload(music=None), TT, audio_only=True)
+    assert out["ext"] == "mp4" and out["download_url"]
+
+
+def test_slideshow_raises_clean_error(monkeypatch):
+    monkeypatch.setattr(api, "_tikwm_fetch",
+                        lambda url: {"images": ["https://cdn/1.jpg"], "title": "pics"})
+    with pytest.raises(RuntimeError, match="slideshow"):
+        api.extract_sync("https://www.tiktok.com/@u/video/123")
+
+
+def test_client_ip_prefers_forwarded_for():
+    req = SimpleNamespace(headers={"x-forwarded-for": "1.2.3.4, 5.6.7.8"}, client=None)
+    assert api.client_ip(req) == "1.2.3.4"
+    direct = SimpleNamespace(headers={}, client=SimpleNamespace(host="9.9.9.9"))
+    assert api.client_ip(direct) == "9.9.9.9"
+
+
+def test_key_url_strips_tracking_params():
+    a = "https://www.tiktok.com/@u/video/123?is_from_webapp=1&sender_device=pc"
+    b = "https://www.tiktok.com/@u/video/123?foo=bar#frag"
+    assert api._key_url(a) == api._key_url(b) == "https://www.tiktok.com/@u/video/123"
+
+
+def test_int_env_falls_back(monkeypatch):
+    monkeypatch.setenv("EXTRACT_TIMEOUT", "not-a-number")
+    assert api._int_env("EXTRACT_TIMEOUT", 26) == 26
+    monkeypatch.setenv("EXTRACT_TIMEOUT", "10")
+    assert api._int_env("EXTRACT_TIMEOUT", 26) == 10
+
+
+def test_post_empty_body_reports_missing_url():
+    r = c.post("/api/extract", json={}, headers=H)
+    assert r.status_code == 400
+    assert "Missing 'url'" in r.json()["detail"]

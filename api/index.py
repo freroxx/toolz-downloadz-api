@@ -32,10 +32,19 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
 
-EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "26"))    # seconds; fits maxDuration=60
-CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per IP
-VERSION = "4.0.0"
+
+def _int_env(name: str, default: int) -> int:
+    """Env int that never crashes the lambda on a malformed value."""
+    try:
+        return int((os.getenv(name) or "").strip() or default)
+    except (ValueError, TypeError):
+        return default
+
+
+EXTRACT_TIMEOUT = _int_env("EXTRACT_TIMEOUT", 26)    # seconds; fits maxDuration=60
+CACHE_TTL = _int_env("CACHE_TTL", 3600)
+RATE_LIMIT = _int_env("RATE_LIMIT", 30)              # per minute per IP
+VERSION = "4.1.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
@@ -51,6 +60,11 @@ _cache: Dict[str, Tuple[float, dict]] = {}
 
 def _ckey(url: str, opts: str) -> str:
     return hashlib.sha256(f"{url}|{opts}".encode()).hexdigest()
+
+
+def _key_url(url: str) -> str:
+    """Cache identity: strip tracking params/fragments so one post hits one entry."""
+    return url.split("?")[0].split("#")[0]
 
 
 def cache_get(key: str) -> Optional[dict]:
@@ -88,16 +102,27 @@ def rate_ok(ident: str) -> bool:
 # ----------------------------------------------------------------------------
 # Cookies (env content -> /tmp file for yt-dlp)
 # ----------------------------------------------------------------------------
+_cookie_hash: Dict[str, str] = {}
+
+
 def _cookies_file(content: str, name: str) -> Optional[str]:
     if not content:
         return None
+    p = os.path.join("/tmp", name)
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    if _cookie_hash.get(name) == digest and os.path.isfile(p):
+        return p  # warm lambda, content unchanged — skip the rewrite
     try:
-        p = os.path.join("/tmp", name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(content if content.endswith("\n") else content + "\n")
+        _cookie_hash[name] = digest
         return p
     except Exception:
         return None
+
+
+class UnsupportedMedia(RuntimeError):
+    """Valid URL, but the content isn't downloadable (e.g. a photo slideshow)."""
 
 
 # ----------------------------------------------------------------------------
@@ -138,12 +163,8 @@ def tiktok_oembed(url: str) -> Optional[dict]:
     return _oembed("https://www.tiktok.com/oembed?url=" + urllib.parse.quote(tiktok_canonical(url), safe=""))
 
 
-def tiktok_tikwm(url: str) -> Optional[dict]:
-    """
-    Cookie-free TikTok engine via the public tikwm.com API.
-    Returns no-watermark HD links hosted on tikwm's CDN — NOT IP-bound, so both
-    extraction and same-instance download work from anywhere (incl. Vercel).
-    """
+def _tikwm_fetch(url: str) -> Optional[dict]:
+    """Raw tikwm payload (the `data` dict) or None on transport/API failure."""
     try:
         api = "https://www.tikwm.com/api/?hd=1&url=" + urllib.parse.quote(tiktok_canonical(url), safe="")
         req = urllib.request.Request(api, headers=BASE_HEADERS)
@@ -151,46 +172,102 @@ def tiktok_tikwm(url: str) -> Optional[dict]:
             data = json.loads(r.read().decode("utf-8"))
         if data.get("code") != 0 or not data.get("data"):
             return None
-        d = data["data"]
-        media = d.get("hdplay") or d.get("play") or d.get("wmplay")
-        if not media:
-            return None
-        video = [{"format_id": "tikwm_hd" if d.get("hdplay") else "tikwm_sd",
-                  "ext": "mp4", "resolution": "1080p no-watermark" if d.get("hdplay") else "SD no-watermark",
-                  "url": media, "filesize": None, "vcodec": "avc1", "acodec": "mp4a",
-                  "height": 1920 if d.get("hdplay") else None, "tbr": None, "abr": None,
-                  "headers": dict(BASE_HEADERS), "cookies": None}]
-        audio = []
-        if d.get("music"):
-            audio.append({"format_id": "tikwm_music", "ext": "mp3", "resolution": "audio",
-                          "url": d["music"], "filesize": None, "vcodec": "none", "acodec": "mp3",
-                          "height": None, "tbr": None, "abr": None,
-                          "headers": dict(BASE_HEADERS), "cookies": None})
-        author = d.get("author") or {}
+        return data["data"]
+    except Exception:
+        return None
 
-        def _g(k):
-            v = d.get(k)
-            try:
-                return int(v) if v is not None else None
-            except Exception:
-                return None
+
+def _num(value) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _tikwm_shape(d: dict, url: str, audio_only: bool = False) -> Optional[dict]:
+    """
+    Build our response from a parsed tikwm payload. Pure (no I/O), so unit-testable.
+
+    Honesty rules: only label what we observe. tikwm reports byte counts
+    (size/hd_size/wm_size) and duration, but no dimensions or codecs — so the
+    resolution tier is approximate and carries a ~ prefix, and codec fields
+    stay null. has_audio is explicit because TikTok delivers muxed A+V files.
+    """
+    media = d.get("hdplay") or d.get("play") or d.get("wmplay")
+    if not media:
+        return None
+    if d.get("hdplay"):
+        size, hd = _num(d.get("hd_size")), True
+    elif d.get("play"):
+        size, hd = _num(d.get("size")), False
+    else:
+        size, hd = _num(d.get("wm_size")), False
+
+    video = [{"format_id": "tikwm_hd" if hd else "tikwm_sd",
+              "ext": "mp4",
+              "resolution": ("~1080p HD, no watermark" if hd else "~SD, no watermark"),
+              "url": media, "filesize": size, "vcodec": None, "acodec": None,
+              "has_audio": True,
+              "height": None, "tbr": None, "abr": None,
+              "headers": dict(BASE_HEADERS), "cookies": None}]
+    audio = []
+    if d.get("music"):
+        audio.append({"format_id": "tikwm_music", "ext": "mp3", "resolution": "audio",
+                      "url": d["music"], "filesize": None, "vcodec": "none", "acodec": None,
+                      "has_audio": False,
+                      "height": None, "tbr": None, "abr": None,
+                      "headers": dict(BASE_HEADERS), "cookies": None})
+    author = d.get("author") or {}
+
+    upload_date = None
+    ct = _num(d.get("create_time"))
+    if ct:
+        upload_date = time.strftime("%Y%m%d", time.gmtime(ct))
+
+    if audio_only and audio:
+        track = audio[0]
         return {
             "platform": "tiktok",
             "title": d.get("title"),
             "thumbnail": d.get("cover") or d.get("origin_cover"),
-            "duration": d.get("duration"),
+            "duration": _num(d.get("duration")),
             "uploader": author.get("nickname"),
             "uploader_url": f"https://www.tiktok.com/@{author.get('unique_id')}" if author.get("unique_id") else None,
-            "stats": {"view_count": _g("play_count"), "like_count": _g("digg_count"),
-                      "comment_count": _g("comment_count")},
-            "upload_date": None, "description": None,
-            "download_url": media, "download_headers": dict(BASE_HEADERS),
-            "ext": "mp4", "blocked": False, "source": "tikwm",
-            "formats": {"video": video, "audio": audio},
+            "stats": {"view_count": _num(d.get("play_count")), "like_count": _num(d.get("digg_count")),
+                      "comment_count": _num(d.get("comment_count"))},
+            "upload_date": upload_date, "description": None,
+            "download_url": track["url"], "download_headers": dict(BASE_HEADERS),
+            "ext": "mp3", "blocked": False, "source": "tikwm",
+            "formats": {"video": [], "audio": audio},
             "original_url": url,
         }
-    except Exception:
+    return {
+        "platform": "tiktok",
+        "title": d.get("title"),
+        "thumbnail": d.get("cover") or d.get("origin_cover"),
+        "duration": _num(d.get("duration")),
+        "uploader": author.get("nickname"),
+        "uploader_url": f"https://www.tiktok.com/@{author.get('unique_id')}" if author.get("unique_id") else None,
+        "stats": {"view_count": _num(d.get("play_count")), "like_count": _num(d.get("digg_count")),
+                  "comment_count": _num(d.get("comment_count"))},
+        "upload_date": upload_date, "description": None,
+        "download_url": media, "download_headers": dict(BASE_HEADERS),
+        "ext": "mp4", "blocked": False, "source": "tikwm",
+        "formats": {"video": video, "audio": audio},
+        "original_url": url,
+    }
+
+
+def tiktok_tikwm(url: str, audio_only: bool = False) -> Optional[dict]:
+    """
+    Cookie-free TikTok engine via the public tikwm.com API.
+    Returns no-watermark links hosted on tikwm's CDN — NOT IP-bound, so both
+    extraction and same-instance download work from anywhere (incl. Vercel).
+    """
+    d = _tikwm_fetch(url)
+    if not d:
         return None
+    return _tikwm_shape(d, url, audio_only)
 
 
 # ----------------------------------------------------------------------------
@@ -243,6 +320,7 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
             "url": f["url"],
             "filesize": f.get("filesize") or f.get("filesize_approx"),
             "vcodec": f.get("vcodec"), "acodec": f.get("acodec"),
+            "has_audio": f.get("has_audio"),  # explicit when the source states it, else null
             "height": f.get("height"), "tbr": f.get("tbr"), "abr": f.get("abr"),
             "headers": dict(f.get("http_headers") or {}),
             "cookies": f.get("cookies"),  # TikTok needs ttwid etc. per-format
@@ -336,9 +414,14 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         # tikwm first: ~1s, HD no-watermark, IP-free CDN. yt-dlp is the
         # fallback because TikTok's anti-bot hangs/flags server IPs often,
         # which previously burned the whole EXTRACT_TIMEOUT budget.
-        alt = tiktok_tikwm(url)
-        if alt:
-            return alt
+        raw = _tikwm_fetch(url)
+        if raw is not None:
+            if raw.get("images") and not (raw.get("hdplay") or raw.get("play") or raw.get("wmplay")):
+                raise UnsupportedMedia("This TikTok is a photo slideshow — only video posts can be downloaded.")
+            shaped = _tikwm_shape(raw, url, audio_only)
+            if shaped:
+                return shaped
+            # Payload parsed but unusable (no media, no images) — fall through to yt-dlp.
         last = None
         candidates = list(dict.fromkeys([url, tiktok_canonical(url)]))
         for _attempt in range(2):
@@ -366,6 +449,14 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
 # ----------------------------------------------------------------------------
 # Auth / validation helpers
 # ----------------------------------------------------------------------------
+def client_ip(request: Request) -> str:
+    """Real visitor IP behind Vercel's proxy (else the rate limit is global)."""
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff:
+        return xff.split(",")[0].strip() or "anon"
+    return request.client.host if request.client else "anon"
+
+
 def check_auth(request: Request) -> None:
     if not API_SECRET_KEY:
         return  # dev mode without key
@@ -444,7 +535,7 @@ async def platforms():
 
 
 async def do_extract(request: Request, url: str, audio_only: bool, custom_format: Optional[str]):
-    ident = request.client.host if request.client else "anon"
+    ident = client_ip(request)
     if not rate_ok(ident):
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({RATE_LIMIT}/min). Slow down.")
     check_auth(request)
@@ -453,7 +544,7 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL. Only TikTok and Instagram are supported.")
 
-    key = _ckey(url, f"{audio_only}|{custom_format}")
+    key = _ckey(_key_url(url), f"{audio_only}|{custom_format}")
     cached = cache_get(key)
     if cached:
         out = dict(cached)
@@ -492,12 +583,13 @@ async def extract_get(
 
 
 @app.post("/api/extract")
-async def extract_post(request: Request, body: Dict[str, Any] = None):
-    try:
-        body = body or await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
-    url = body.get("url")
+async def extract_post(request: Request, body: Optional[Dict[str, Any]] = None):
+    if body is None:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+    url = (body or {}).get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' in body")
     return await do_extract(request, url, bool(body.get("audio_only")), body.get("format"))
@@ -533,7 +625,7 @@ async def download(
     resp = None
 
     async def _resolve(fresh: bool) -> dict:
-        key = _ckey(page_url, "False|None")
+        key = _ckey(_key_url(page_url), "False|None")
         result = None if fresh else cache_get(key)
         if not result or result.get("blocked"):
             loop = asyncio.get_running_loop()
@@ -546,6 +638,9 @@ async def download(
                 raise HTTPException(504, f"Preparing the download timed out (~{EXTRACT_TIMEOUT}s). Tap Download once more — retries usually succeed.")
             except HTTPException:
                 raise
+            except RuntimeError as e:
+                # extract_sync failures (IG cookies, slideshows) are client errors, not 500s
+                raise HTTPException(400, str(e)[:300])
             if result.get("blocked"):
                 raise HTTPException(409, result.get("blocked_message", "Extraction blocked"))
             cache_set(key, result)
