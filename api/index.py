@@ -1,6 +1,6 @@
 """
-toolz-downloadz-api v3.0 — single-file, self-contained FastAPI app for Vercel.
-Platforms: YouTube, TikTok, Instagram Reels ONLY.
+toolz-downloadz-api v4.0 — single-file, self-contained FastAPI app for Vercel.
+Platforms: TikTok + Instagram ONLY.
 
 Why single file: Vercel's Python builder is picky about packages inside api/.
 A flat, dependency-free-import file eliminates the NOT_FOUND class of bugs.
@@ -8,22 +8,19 @@ A flat, dependency-free-import file eliminates the NOT_FOUND class of bugs.
 Run locally:  uvicorn api.index:app --reload   (or: python api/index.py)
 """
 import os
-import re
-import sys
-import glob
-import shutil
 import time
 import json
 import asyncio
 import hashlib
 import urllib.request
 import urllib.parse
+import urllib.error
 from collections import defaultdict, deque
 from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,71 +30,18 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 # Config (env)
 # ----------------------------------------------------------------------------
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
-YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
-POT_PROVIDER_URL = os.getenv("YT_DLP_POT_PROVIDER_URL", "").strip() or os.getenv("POT_PROVIDER_URL", "").strip()
 
-# Hot-reloadable cookie store (Upstash Redis REST / Vercel KV).
-# Precedence: KV value (if set) > YOUTUBE_COOKIES env. Lets you refresh
-# cookies via POST /api/admin/cookies without a redeploy.
-KV_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or "").strip()
-KV_REST_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN") or "").strip()
-COOKIES_KV_KEY = "toolz:yt_cookies"
-COBALT_API_URL = (os.getenv("COBALT_API_URL") or "").strip().rstrip("/")
-COBALT_API_KEY = (os.getenv("COBALT_API_KEY") or "").strip()  # if your instance requires a key
-
-COBALT_QUALITIES = [
-    {"f": "cobalt_360",  "label": "360p"},
-    {"f": "cobalt_720",  "label": "720p"},
-    {"f": "cobalt_1080", "label": "1080p"},
-    {"f": "cobalt_1440", "label": "1440p"},
-    {"f": "cobalt_2160", "label": "4K"},
-    {"f": "cobalt_mp3",  "label": "MP3"},
-]
-
-
-def _find_node_dir() -> Optional[str]:
-    """Locate the node binary (nodejs-wheel-binaries installs one on Vercel)."""
-    p = shutil.which("node")
-    if p:
-        return os.path.dirname(p)
-    cands = ["/tmp/_vc_deps/bin/node"]
-    for sp in list(sys.path) + [os.getcwd()]:
-        cands += glob.glob(os.path.join(sp, "nodejs_wheel", "bin", "node"))
-        cands += glob.glob(os.path.join(sp, "nodejs-wheel-binaries", "**", "node"), recursive=True)
-        cands += glob.glob(os.path.join(sp, "bin", "node"))
-    for c in cands:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            return os.path.dirname(c)
-    return None
-
-
-NODE_DIR = _find_node_dir()
-
-
-
-def _pot_plugin_installed() -> bool:
-    """The bgutil yt-dlp plugin MUST be importable or tokens are never minted."""
-    import importlib.util
-    return importlib.util.find_spec("yt_dlp_plugins.extractor.getpot_bgutil_http") is not None
 EXTRACT_TIMEOUT = int(os.getenv("EXTRACT_TIMEOUT", "26"))    # seconds; fits maxDuration=60
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))
-RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per key
-VERSION = "3.9.0"
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "30"))              # per minute per IP
+VERSION = "4.0.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 BASE_HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 
-SUPPORTED = ["youtube", "tiktok", "instagram"]
-
-# None = don't override player_client at all (yt-dlp defaults — best when cookies are set)
-YT_CLIENT_STRATEGIES = [
-    ["tv_simply", "tv", "web_safari"],
-    ["android", "ios"],
-    ["web_embedded"],
-    None,
-]
+SUPPORTED = ["tiktok", "instagram"]
 
 # ----------------------------------------------------------------------------
 # Tiny in-memory cache + rate limiter (per-lambda; zero infra)
@@ -156,145 +100,11 @@ def _cookies_file(content: str, name: str) -> Optional[str]:
         return None
 
 
-# --- Cookie lifecycle: analyze, KV hot-reload, gate -------------------------
-LOGIN_PROOF = ("SID", "__Secure-1PSID", "LOGIN_INFO")
-ROTATING = ("SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC")
-
-_cookie_memo = {"ts": 0.0, "payload": None}  # memoized resolver result (60s)
-
-
-def _parse_cookies(content: str) -> Dict[str, dict]:
-    """Netscape format -> {name: {expiry:int, domain:str, value:str}}"""
-    out: Dict[str, dict] = {}
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
-            continue
-        parts = line.split("\t")
-        if len(parts) < 7:
-            continue
-        domain, _flag, _path, _secure, expiry, name = parts[:6]
-        out[name] = {"expiry": int(expiry) if expiry.isdigit() else 0,
-                     "domain": domain, "value": parts[6]}
-    return out
-
-
-def _analyze_cookies(content: str) -> Dict[str, Any]:
-    """Verdict engine: fresh | aging | expired | not_logged_in | invalid."""
-    if not content or not content.strip():
-        return {"verdict": "none_set", "logged_in": False, "days_left": None,
-                "expired": [], "hint": "No cookies configured."}
-    cookies = _parse_cookies(content)
-    names = set(cookies)
-    if not names:
-        return {"verdict": "invalid", "logged_in": False, "days_left": None,
-                "expired": [], "hint": "Content is not Netscape cookie format."}
-    logged_in = bool(names & {"SID", "__Secure-1PSID"}) or "LOGIN_INFO" in names
-    now = time.time()
-    expired, days_left_min = [], None
-    rot = [n for n in ROTATING if n in cookies]
-    if rot:
-        for n in rot:
-            left = (cookies[n]["expiry"] - now) / 86400.0
-            days_left_min = left if days_left_min is None else min(days_left_min, left)
-            if left <= 0:
-                expired.append(n)
-        dl = round(max(days_left_min, 0), 1)
-    else:
-        dl = None  # no rotating cookies present — can't judge freshness
-    if not logged_in:
-        verdict = "not_logged_in"
-    elif expired or (dl is not None and dl <= 0):
-        verdict = "expired"
-    elif dl is not None and dl < 2:
-        verdict = "aging"
-    else:
-        verdict = "fresh"
-    hint = {
-        "fresh": f"OK — ~{dl}d until rotation.",
-        "aging": f"Rotates soon (~{dl}d). Refresh when convenient.",
-        "expired": "Session cookies expired — YouTube will bot-block. Re-export.",
-        "not_logged_in": "Export lacks login cookies (no SID). Export while logged in.",
-        "invalid": "Unparsable content.",
-        "none_set": "Not configured.",
-    }[verdict]
-    return {"verdict": verdict, "logged_in": logged_in, "days_left": dl,
-            "expired": expired, "hint": hint}
-
-
-def _kv_get(key: str) -> Optional[str]:
-    if not (KV_REST_URL and KV_REST_TOKEN):
-        return None
-    try:
-        req = urllib.request.Request(
-            f"{KV_REST_URL.rstrip('/')}/get/{urllib.parse.quote(key, safe='')}",
-            headers={"Authorization": f"Bearer {KV_REST_TOKEN}"})
-        with urllib.request.urlopen(req, timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        raw = data.get("result")
-        return raw if isinstance(raw, str) else None
-    except Exception:
-        return None
-
-
-def _kv_set(key: str, value: str) -> bool:
-    if not (KV_REST_URL and KV_REST_TOKEN):
-        return False
-    try:
-        req = urllib.request.Request(
-            f"{KV_REST_URL.rstrip('/')}/set/{urllib.parse.quote(key, safe='')}",
-            data=value.encode("utf-8"),
-            headers={"Authorization": f"Bearer {KV_REST_TOKEN}",
-                     "Content-Type": "text/plain"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            r.read()
-        return True
-    except Exception:
-        return False
-
-
-def _kv_del(key: str) -> bool:
-    if not (KV_REST_URL and KV_REST_TOKEN):
-        return False
-    try:
-        req = urllib.request.Request(
-            f"{KV_REST_URL.rstrip('/')}/del/{urllib.parse.quote(key, safe='')}",
-            headers={"Authorization": f"Bearer {KV_REST_TOKEN}"}, method="POST")
-        with urllib.request.urlopen(req, timeout=5) as r:
-            r.read()
-        return True
-    except Exception:
-        return False
-
-
-def get_youtube_cookies() -> Dict[str, Any]:
-    """
-    Effective YouTube cookies with precedence KV > env, gated by freshness.
-    Returns {"content": str|None (None = do NOT send), "source", **analysis}.
-    Memoized 60s so per-request latency stays zero; admin POST invalidates locally.
-    """
-    now = time.time()
-    if _cookie_memo["payload"] and now - _cookie_memo["ts"] < 60:
-        return _cookie_memo["payload"]
-    kv = _kv_get(COOKIES_KV_KEY)
-    source = "kv" if kv else "env"
-    content = kv or YOUTUBE_COOKIES
-    analysis = _analyze_cookies(content)
-    # Smart gating: never send dead/invalid sessions — they make blocks worse.
-    send = analysis["verdict"] in ("fresh", "aging") and analysis["logged_in"] and content
-    payload = {"content": content if send else None, "raw_present": bool(content),
-               "source": source if content else "none", **analysis}
-    _cookie_memo.update({"ts": now, "payload": payload})
-    return payload
-
-
 # ----------------------------------------------------------------------------
-# Platform detection — strict allowlist
+# Platform detection — strict allowlist (TikTok + Instagram only)
 # ----------------------------------------------------------------------------
 def detect_platform(url: str) -> Optional[str]:
     u = url.lower()
-    if any(d in u for d in ("youtube.com", "youtu.be")):
-        return "youtube"
     if "tiktok.com" in u:
         return "tiktok"
     if "instagram.com" in u and ("/reel" in u or "/reels" in u or "/p/" in u):
@@ -304,88 +114,6 @@ def detect_platform(url: str) -> Optional[str]:
 
 def tiktok_canonical(url: str) -> str:
     return url.split("?")[0].split("#")[0]
-
-
-def _cobalt_request(payload: Dict[str, Any]) -> Dict[str, Any]:
-    headers = {"Accept": "application/json", "Content-Type": "application/json",
-               "User-Agent": UA}
-    if COBALT_API_KEY:
-        headers["Authorization"] = f"Api-Key {COBALT_API_KEY}"
-    req = urllib.request.Request(COBALT_API_URL + "/", data=json.dumps(payload).encode(),
-                                 headers=headers)
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def _cobalt_pick(url: str, quality: str) -> Optional[Dict[str, Any]]:
-    """
-    Ask YOUR cobalt instance for the media. Returns {"url","filename"} on
-    success (tunnel = streamed via your instance → IP-free for downloader),
-    or {"error": ...}.
-    """
-    if not COBALT_API_URL:
-        return {"error": "COBALT_API_URL not configured"}
-    payload: Dict[str, Any] = {
-        "url": url,
-        "videoQuality": {"360": "360", "480": "480", "720": "720",
-                         "1080": "1080", "1440": "1440", "2160": "2160"}.get(quality, "720"),
-        "youtubeVideoCodec": "h264",   # avc1 plays everywhere & muxes into mp4
-        "downloadMode": "auto",
-        "filenameStyle": "basic",
-    }
-    if quality == "mp3":
-        payload["downloadMode"] = "audio"
-        payload["audioFormat"] = "mp3"
-        payload["audioBitrate"] = "320"
-        payload.pop("videoQuality", None)
-        payload.pop("youtubeVideoCodec", None)
-    try:
-        data = _cobalt_request(payload)
-    except Exception as e:
-        return {"error": str(e)[:200]}
-    status = data.get("status")
-    if status in ("tunnel", "redirect", "local-processing") and data.get("url"):
-        return {"url": data["url"], "filename": data.get("filename"), "status": status}
-    return {"error": str(data.get("text") or data.get("error") or status or data)[:200]}
-
-
-def _yt_video_id(url: str) -> Optional[str]:
-    """Extract the 11-char video id from any YouTube URL shape."""
-    p = urllib.parse.urlparse(url)
-    host = (p.hostname or "").replace("www.", "")
-    if host == "youtu.be":
-        vid = p.path.lstrip("/").split("/")[0]
-        return vid or None
-    q = urllib.parse.parse_qs(p.query).get("v")
-    if q:
-        return q[0]
-    parts = [s for s in p.path.split("/") if s]
-    for i, seg in enumerate(parts):
-        if seg in ("shorts", "embed", "v", "live") and i + 1 < len(parts):
-            return parts[i + 1]
-    m = re.search(r"[a-zA-Z0-9_-]{11}", url)
-    return m.group(0) if m else None
-
-
-def _mint_video_bound_token(video_id: str) -> Optional[str]:
-    """
-    Mint a PO token bound to the VIDEO ID via our toolz-pot server.
-    tv-client tokens bound to content (not visitor) are honored regardless of
-    IP reputation — this is the cookie-free Vercel bypass.
-    """
-    if not POT_PROVIDER_URL:
-        return None
-    try:
-        body = json.dumps({"content_binding": video_id, "bypass_cache": True}).encode()
-        req = urllib.request.Request(
-            POT_PROVIDER_URL.rstrip("/") + "/get_pot", data=body,
-            headers={"User-Agent": UA, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        tok = data.get("poToken")
-        return tok or None
-    except Exception:
-        return None
 
 
 # ----------------------------------------------------------------------------
@@ -404,10 +132,6 @@ def _oembed(endpoint_url: str) -> Optional[dict]:
         }
     except Exception:
         return None
-
-
-def youtube_oembed(url: str) -> Optional[dict]:
-    return _oembed("https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(url, safe=""))
 
 
 def tiktok_oembed(url: str) -> Optional[dict]:
@@ -443,9 +167,9 @@ def tiktok_tikwm(url: str) -> Optional[dict]:
                           "height": None, "tbr": None, "abr": None,
                           "headers": dict(BASE_HEADERS), "cookies": None})
         author = d.get("author") or {}
-        stats_src = d
+
         def _g(k):
-            v = stats_src.get(k)
+            v = d.get(k)
             try:
                 return int(v) if v is not None else None
             except Exception:
@@ -472,8 +196,8 @@ def tiktok_tikwm(url: str) -> Optional[dict]:
 # ----------------------------------------------------------------------------
 # yt-dlp options per platform
 # ----------------------------------------------------------------------------
-def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[str] = None,
-             yt_clients: Optional[List[str]] = None) -> Dict[str, Any]:
+def ydl_opts(platform: str, audio_only: bool = False,
+             custom_format: Optional[str] = None) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -485,34 +209,7 @@ def ydl_opts(platform: str, audio_only: bool = False, custom_format: Optional[st
         "http_headers": BASE_HEADERS,
         "extractor_args": {},
     }
-    # EJS: let yt-dlp solve BotGuard/JS challenges with the bundled node
-    # (nodejs-wheel-binaries ships node inside the Vercel deps venv).
-    if NODE_DIR:
-        opts["js_runtimes"] = {"deno": {}, "node": {"path": os.path.join(NODE_DIR, "node")}}
-        opts["remote_components"] = ["ejs:npm", "ejs:github"]
-    if platform == "youtube":
-        yt_ck = get_youtube_cookies()
-        cf = _cookies_file(yt_ck["content"], "yt_cookies.txt") if yt_ck["content"] else None
-        if cf:
-            opts["cookiefile"] = cf
-        # Vercel has no ffmpeg → NEVER select merge-pairs ("bv*+ba"). Also note
-        # yt-dlp's `best`/`b` only match A+V files; DASH-only sessions need `bv*`.
-        # Progressive first, then best pure-video file (UI lists audio separately).
-        if POT_PROVIDER_URL:
-            # PO-token provider (bgutil) — modern cookie-free YouTube bypass.
-            opts["format"] = custom_format or (
-                "bestaudio/best" if audio_only
-                else "best[vcodec!=none][acodec!=none]/bv*[protocol^=https]/bv*")
-            opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": POT_PROVIDER_URL}
-        else:
-            opts["format"] = custom_format or (
-                "bestaudio/best" if audio_only
-                else "best[vcodec!=none][acodec!=none][ext=mp4]/bv*[protocol^=https][ext=mp4]/b")
-        # Client pinning works with or without POT (plugin mints per-client)
-        if yt_clients:
-            opts["extractor_args"]["youtube"] = {"player_client": yt_clients}
-    elif platform == "tiktok":
-        # NOTE: no api_hostname override — defaults are what currently work
+    if platform == "tiktok":
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
     elif platform == "instagram":
         cf = _cookies_file(INSTAGRAM_COOKIES, "ig_cookies.txt")
@@ -526,45 +223,6 @@ def run_ydl(opts: Dict[str, Any], url: str) -> dict:
     import yt_dlp
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
-
-
-# ----------------------------------------------------------------------------
-# pytubefix fallback engine for YouTube
-# ----------------------------------------------------------------------------
-def youtube_pytubefix(url: str) -> Optional[dict]:
-    try:
-        from pytubefix import YouTube
-    except Exception:
-        return None
-    try:
-        yt = YouTube(url)
-        video, audio = [], []
-        for s in yt.streams:
-            if not s.url:
-                continue
-            fmt = {
-                "format_id": s.itag,
-                "ext": (s.mime_type.split("/")[-1] if s.mime_type else "mp4"),
-                "resolution": s.resolution or s.abr or "audio",
-                "url": s.url,
-                "filesize": s.filesize,
-                "vcodec": "none" if not s.resolution else "avc1",
-                "acodec": "mp4a" if s.abr else None,
-                "headers": {"User-Agent": "com.google.android.youtube/19.09.37"},
-            }
-            (audio if (s.abr or not s.resolution) else video).append(fmt)
-        dl = next((s.url for s in yt.streams.filter(progressive=True, file_extension="mp4")), None)
-        return {
-            "platform": "youtube", "title": yt.title, "thumbnail": yt.thumbnail_url,
-            "duration": getattr(yt, "length", None), "uploader": yt.author,
-            "uploader_url": None,
-            "stats": {}, "upload_date": None, "description": None,
-            "download_url": dl, "download_headers": {"User-Agent": "com.google.android.youtube/19.09.37"},
-            "ext": "mp4", "blocked": False,
-            "formats": {"video": video, "audio": audio}, "original_url": url,
-        }
-    except Exception:
-        return None
 
 
 # ----------------------------------------------------------------------------
@@ -607,7 +265,6 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
     dl = info.get("url")
     hdrs = dict(info.get("http_headers") or {})
     dl_cookies = None
-    # Merge-selected (POT/DASH): requested_formats holds the pair — prefer VIDEO
     if not dl and info.get("requested_formats"):
         wanted = [f for f in info["requested_formats"]
                   if f.get("vcodec") != "none" and "m3u8" not in (f.get("protocol") or "")
@@ -662,9 +319,6 @@ def blocked_shape(platform: str, meta: dict, original_url: str, msg: str) -> dic
 
 
 BLOCK_MSGS = {
-    "youtube": ("YouTube is blocking this server IP right now (common on Vercel). "
-                "Metadata below is from YouTube's public oEmbed. Fix: set YOUTUBE_COOKIES env "
-                "(Netscape cookies.txt from your browser) and redeploy, or retry later."),
     "tiktok": ("TikTok extraction failed on this server IP. "
                "Metadata below is from TikTok's public oEmbed. Try again in a minute."),
 }
@@ -676,96 +330,7 @@ BLOCK_MSGS = {
 def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str] = None) -> dict:
     platform = detect_platform(url)
     if not platform:
-        raise ValueError("Unsupported URL. Only YouTube, TikTok and Instagram Reels are supported.")
-
-    if platform == "youtube":
-        ck_state = get_youtube_cookies()
-        last = None
-
-        # Warm the POT provider (cold boot + BotGuard init can take 5-10s;
-        # the plugin's own HTTP timeout is shorter than that). We're already
-        # inside an executor thread here, so blocking is fine.
-        if POT_PROVIDER_URL:
-            try:
-                urllib.request.urlopen(urllib.request.Request(
-                    POT_PROVIDER_URL.rstrip("/") + "/ping", headers={"User-Agent": UA}), timeout=8)
-            except Exception:
-                pass
-        # Full rotation ALWAYS — tv-family first (least bot-walled), plugin
-        # mints per-client PO tokens when POT is configured.
-        strategy_errors: Dict[str, str] = {}
-        # PRIMARY: tv client + video-ID-bound PO token (IP-reputation-immune)
-        vid = _yt_video_id(url)
-        if POT_PROVIDER_URL and vid:
-            tok = _mint_video_bound_token(vid)
-            if tok:
-                o = ydl_opts("youtube", audio_only, custom_format, ["tv"])
-                ea = o.setdefault("extractor_args", {}).setdefault("youtube", {})
-                ea["po_token"] = [f"tv.player+{tok}"]
-                ea["fetch_pot"] = ["never"]
-                try:
-                    return shape(platform, run_ydl(o, url), url)
-                except Exception as e:
-                    last = str(e)
-                    strategy_errors["tv+videobound"] = last[:120]
-
-        for clients in YT_CLIENT_STRATEGIES:
-            label = "+".join(clients) if clients else "defaults"
-            try:
-                return shape(platform, run_ydl(ydl_opts("youtube", audio_only, custom_format, clients), url), url)
-            except Exception as e:
-                last = str(e)
-                strategy_errors[label] = last[:120]
-                # Try every strategy — tv-family often passes where web was walled.
-                continue
-        # Open-source rescue: YOUR cobalt instance extracts on ITS egress IP
-        # and tunnels the file — completely sidesteps our datacenter reputation.
-        if COBALT_API_URL:
-            res = _cobalt_pick(url, "720" if not audio_only else "mp3")
-            if res and res.get("url"):
-                entry = {
-                    "format_id": f"cobalt_{('mp3' if audio_only else '720')}",
-                    "ext": "mp3" if audio_only else "mp4",
-                    "resolution": "audio" if audio_only else "720p A+V",
-                    "url": res["url"], "filesize": None,
-                    "vcodec": "none" if audio_only else "avc1",
-                    "acodec": None if audio_only else "mp4a",
-                    "height": None, "tbr": None, "abr": None,
-                    "headers": {"User-Agent": UA}, "cookies": None,
-                }
-                out = blocked_shape(platform, {"title": f"YouTube {_yt_video_id(url) or ''}".strip(),
-                                               "thumbnail": None}, url, "") if False else None
-                return {
-                    "platform": platform,
-                    "title": f"YouTube video {(_yt_video_id(url) or '').strip()}",
-                    "thumbnail": None, "duration": None, "uploader": None, "uploader_url": None,
-                    "stats": {}, "upload_date": None, "description": None,
-                    "download_url": res["url"],
-                    "download_headers": {"User-Agent": UA},
-                    "download_cookies": None,
-                    "ext": "mp3" if audio_only else "mp4",
-                    "blocked": False, "source": "cobalt",
-                    "formats": {"video": [] if audio_only else [entry],
-                                "audio": [dict(entry, format_id="cobalt_mp3", ext="mp3",
-                                               vcodec="none", acodec="mp3", resolution="audio")] if audio_only else []},
-                    "original_url": url,
-                }
-        alt = youtube_pytubefix(url)
-        if alt:
-            return alt
-        meta = youtube_oembed(url)
-        if meta:
-            pass_placeholder = None(f"{k}:{v.split(':')[0][:48]}" for k, v in list(strategy_errors.items())[:4])
-            diag = f"{(last or 'unknown')[:120]} [{strat}]"
-            return blocked_shape(
-                "youtube", meta, url,
-                BLOCK_MSGS["youtube"] + (
-                    f"\n\n[diag: {diag} | pot={'on' if POT_PROVIDER_URL else 'off'} | "
-                    f"cookies={ck_state.get('verdict')} | "
-                    f"plugin={'on' if _pot_plugin_installed() else 'MISSING'} | "
-                    f"cobalt={'on' if COBALT_API_URL else 'off'}]")
-            )
-        raise RuntimeError(f"YouTube extraction failed: {(last or 'unknown')[:300]}")
+        raise ValueError("Unsupported URL. Only TikTok and Instagram are supported.")
 
     if platform == "tiktok":
         # tikwm first: ~1s, HD no-watermark, IP-free CDN. yt-dlp is the
@@ -776,7 +341,7 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
             return alt
         last = None
         candidates = list(dict.fromkeys([url, tiktok_canonical(url)]))
-        for attempt in range(2):
+        for _attempt in range(2):
             for candidate in candidates:
                 try:
                     return shape(platform, run_ydl(ydl_opts("tiktok", audio_only, custom_format), candidate), url)
@@ -788,7 +353,7 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
             return blocked_shape("tiktok", meta, url, BLOCK_MSGS["tiktok"])
         raise RuntimeError(f"TikTok extraction failed: {(last or 'unknown')[:300]}")
 
-    # instagram reels
+    # instagram reels / posts
     try:
         return shape(platform, run_ydl(ydl_opts("instagram", audio_only, custom_format), url), url)
     except Exception as e:
@@ -835,7 +400,7 @@ def clean_url(url: str) -> str:
 # ----------------------------------------------------------------------------
 app = FastAPI(
     title="toolz-downloadz-api",
-    description="Media extraction for YouTube, TikTok and Instagram Reels",
+    description="Media extraction for TikTok and Instagram",
     version=VERSION,
 )
 
@@ -853,165 +418,6 @@ async def unhandled(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"Internal error: {str(exc)[:200]}"})
 
 
-def _pot_status() -> Dict[str, Any]:
-    if not POT_PROVIDER_URL:
-        return {"configured": False, "hint": "Set YT_DLP_POT_PROVIDER_URL in Vercel env"}
-    base = POT_PROVIDER_URL.rstrip("/")
-    out: Dict[str, Any] = {"configured": True, "base": base}
-    t0 = time.time()
-    try:
-        req = urllib.request.Request(base + "/ping", headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            out["ping_status"] = r.status
-            out["ping_ms"] = int((time.time() - t0) * 1000)
-    except Exception as e:
-        out["ping_ms"] = int((time.time() - t0) * 1000)
-        out["ping_error"] = str(e)[:200]
-        return out
-    if out["ping_ms"] > 5000:
-        out["warning"] = f"ping took {out['ping_ms']}ms; yt-dlp plugin gives up after 5000ms and skips POT"
-    t1 = time.time()
-    try:
-        req = urllib.request.Request(
-            base + "/get_pot",
-            data=json.dumps({"bypass_cache": False}).encode(),
-            headers={"User-Agent": UA, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            body = json.loads(r.read().decode("utf-8", "ignore"))
-            out["get_pot_ms"] = int((time.time() - t1) * 1000)
-            tok = body.get("poToken") or ""
-            out["token_preview"] = (tok[:24] + "…") if tok else None
-            out["mint_ok"] = bool(tok)
-    except Exception as e:
-        out["get_pot_ms"] = int((time.time() - t1) * 1000)
-        out["get_pot_error"] = str(e)[:250]
-        out["mint_ok"] = False
-    return out
-
-
-@app.get("/api/ytdebug")
-async def ytdebug(request: Request, url: str = Query(...)):
-    """Run every YouTube strategy and return the per-client error map."""
-    check_auth(request)
-    clean = clean_url(url)
-    if detect_platform(clean) != "youtube":
-        raise HTTPException(status_code=400, detail="Not a YouTube URL")
-    results = []
-    vid = _yt_video_id(clean)
-    if POT_PROVIDER_URL and vid:
-        tok = _mint_video_bound_token(vid)
-        if tok:
-            o = ydl_opts("youtube", False, None, ["tv"])
-            ea = o.setdefault("extractor_args", {}).setdefault("youtube", {})
-            ea["po_token"] = [f"tv.player+{tok}"]
-            ea["fetch_pot"] = ["never"]
-            try:
-                info = run_ydl(o, clean)
-                results.append({"strategy": "tv+videobound", "ok": True,
-                                "formats": len((info or {}).get("formats") or [])})
-            except Exception as e:
-                results.append({"strategy": "tv+videobound", "ok": False,
-                                "error": str(e).replace("ERROR: ", "")[:160]})
-    for clients in YT_CLIENT_STRATEGIES:
-        label = "+".join(clients) if clients else "defaults"
-        try:
-            info = run_ydl(ydl_opts("youtube", False, None, clients), clean)
-            fmts = len((info or {}).get("formats") or [])
-            results.append({"strategy": label, "ok": True, "formats": fmts})
-        except Exception as e:
-            msg = str(e).replace("ERROR: ", "")[:160]
-            results.append({"strategy": label, "ok": False,
-                            "bot_block": ("Sign in to confirm" in str(e)) or ("not a bot" in str(e)),
-                            "error": msg})
-    pyt = youtube_pytubefix(clean)
-    results.append({"strategy": "pytubefix", "ok": bool(pyt),
-                    "note": None if pyt else "no streams"})
-    pot = _pot_status()
-    ck = get_youtube_cookies()
-    return {"url": clean, "results": results,
-            "pot": {"configured": bool(POT_PROVIDER_URL), "plugin_installed": _pot_plugin_installed(), **{k: pot.get(k) for k in ("ping_ms", "mint_ok", "get_pot_error", "warning") if k in pot}},
-            "cookies": {k: v for k, v in ck.items() if k != "content"}}
-
-
-@app.get("/api/potcheck")
-async def potcheck(request: Request):
-    check_auth(request)
-    return _pot_status()
-
-
-@app.get("/api/diag")
-async def diag(request: Request):
-    """Cookie doctor + POT status. Auth-protected (reveals session metadata)."""
-    check_auth(request)
-    ck = get_youtube_cookies()
-    ck_public = {k: v for k, v in ck.items() if k != "content"}
-    pot = _pot_status()
-    verdict = ck_public.get("verdict")
-    action = {
-        "fresh": "Nothing to do.",
-        "aging": ck_public.get("hint", ""),
-        "expired": "Re-export cookies from a logged-in youtube.com browser and POST to /api/admin/cookies.",
-        "not_logged_in": "Export was made while logged out. Log in, then re-export.",
-        "invalid": "Content is not a valid cookies.txt. Re-export via 'Get cookies.txt LOCALLY'.",
-        "none_set": "Set YOUTUBE_COOKIES in Vercel env or POST /api/admin/cookies.",
-    }[verdict]
-    return {
-        "version": VERSION,
-        "cookies": {**ck_public,
-                    "action": action,
-                    "kv_configured": bool(KV_REST_URL and KV_REST_TOKEN)},
-        "pot": pot,
-        "effective": {"youtube_cookies_sent": bool(ck.get("content")),
-                      "instagram_cookies": bool(INSTAGRAM_COOKIES)},
-    }
-
-
-@app.post("/api/admin/cookies")
-async def admin_cookies_post(request: Request):
-    check_auth(request)
-    ctype = (request.headers.get("content-type") or "").lower()
-    if "application/json" in ctype:
-        try:
-            body = await request.json()
-            content = (body or {}).get("cookies", "")
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
-    else:
-        content = (await request.body()).decode("utf-8", "ignore")
-    analysis = _analyze_cookies(content)
-    if analysis["verdict"] in ("invalid", "not_logged_in"):
-        raise HTTPException(status_code=400, detail=f"Rejected: {analysis['hint']}")
-    if not (KV_REST_URL and KV_REST_TOKEN):
-        raise HTTPException(status_code=501,
-                            detail="Cookies look valid, but hot-reload needs Vercel KV / Upstash REST. "
-                                   "Vercel Dashboard → Storage → Create KV → connect this project. "
-                                   "(Or paste into YOUTUBE_COOKIES env + redeploy.)")
-    ok = _kv_set(COOKIES_KV_KEY, content)
-    if not ok:
-        raise HTTPException(status_code=502, detail="KV write failed — check KV_REST_* env vars")
-    _cookie_memo.update({"ts": 0.0, "payload": None})  # this lambda refreshes instantly
-    days = analysis.get("days_left")
-    return {"stored": True, "verdict": analysis["verdict"],
-            "logged_in": analysis["logged_in"],
-            "days_left": round(days, 1) if isinstance(days, (int, float)) else days,
-            "note": "Other lambdas pick it up within 60s."}
-
-
-@app.delete("/api/admin/cookies")
-async def admin_cookies_delete(request: Request):
-    check_auth(request)
-    _kv_del(COOKIES_KV_KEY)
-    _cookie_memo.update({"ts": 0.0, "payload": None})
-    return {"cleared": True}
-
-
-@app.get("/api/admin/cookies")
-async def admin_cookies_get(request: Request):
-    check_auth(request)
-    ck = get_youtube_cookies()
-    return {k: v for k, v in ck.items() if k != "content"}
-
-
 @app.get("/api/health")
 async def health():
     return {
@@ -1020,7 +426,7 @@ async def health():
         "version": VERSION,
         "platforms": SUPPORTED,
         "auth": bool(API_SECRET_KEY),
-        "cookies": {"youtube": get_youtube_cookies().get("verdict"), "instagram": bool(INSTAGRAM_COOKIES)},
+        "cookies": {"instagram": bool(INSTAGRAM_COOKIES)},
     }
 
 
@@ -1032,9 +438,8 @@ async def root():
 @app.get("/api/platforms")
 async def platforms():
     return {"platforms": [
-        {"id": "youtube", "name": "YouTube", "color": "#FF0000"},
         {"id": "tiktok", "name": "TikTok", "color": "#000000"},
-        {"id": "instagram", "name": "Instagram Reels", "color": "gradient"},
+        {"id": "instagram", "name": "Instagram", "color": "gradient"},
     ]}
 
 
@@ -1046,14 +451,12 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     url = clean_url(url)
     platform = detect_platform(url)
     if not platform:
-        raise HTTPException(status_code=400, detail="Unsupported URL. Only YouTube, TikTok and Instagram Reels are supported.")
+        raise HTTPException(status_code=400, detail="Unsupported URL. Only TikTok and Instagram are supported.")
 
     key = _ckey(url, f"{audio_only}|{custom_format}")
     cached = cache_get(key)
     if cached:
         out = dict(cached)
-        if platform == "youtube" and COBALT_API_URL:
-            out.setdefault("quality_options", COBALT_QUALITIES)
         out["_cached"] = True
         return out
 
@@ -1073,8 +476,6 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if platform == "youtube" and COBALT_API_URL:
-        result.setdefault("quality_options", COBALT_QUALITIES)
     if not result.get("blocked"):
         cache_set(key, result)
     return result
@@ -1104,7 +505,7 @@ async def extract_post(request: Request, body: Dict[str, Any] = None):
 
 # ----------------------------------------------------------------------------
 # One-step download: resolve formats + stream media FROM THE SAME LAMBDA.
-# Critical because YouTube/TikTok sign media URLs to the requesting IP — a
+# Critical because TikTok signs media URLs to the requesting IP — a
 # separate proxy server gets 403. Same-instance fetch keeps the signature valid.
 # ----------------------------------------------------------------------------
 def _sanitize_name(name: str) -> str:
@@ -1119,27 +520,11 @@ async def download(
     f: str = Query("best", description="yt-dlp format_id, or 'best'"),
     n: str = Query("", description="Filename"),
 ):
-    ident = request.client.host if request.client else "anon"
     check_auth(request)  # supports ?key= for browser navigation
     page_url = clean_url(u)
     platform = detect_platform(page_url)
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL")
-
-    # On-demand quality ladder via YOUR open-source cobalt instance
-    # (AGPL — https://github.com/imputnet/cobalt). Set COBALT_API_URL after
-    # deploying it anywhere (Docker/Render/Railway/…). Tunnel URLs stream via
-    # your instance, so downloads work regardless of our egress IP.
-    if f.startswith("cobalt_"):
-        q = f.split("_", 1)[1]
-        loop = asyncio.get_running_loop()
-        res = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: _cobalt_pick(page_url, q)),
-            timeout=55)
-        if not (res and res.get("url")):
-            raise HTTPException(status_code=502,
-                                detail=f"{q} via cobalt failed: {str((res or {}).get('error'))[:120] or 'no url'}")
-        return RedirectResponse(res["url"], status_code=307)
 
     # Resolve + stream via explicit strategy chain. Each strategy is one
     # (resolve-mode, media-source) combo; first successful open wins.
