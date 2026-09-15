@@ -85,7 +85,7 @@ Auth via `X-API-KEY`, `Authorization: Bearer`, or `?key=` (the last one exists s
 
 With `audio_only=true`, the TikTok response serves the music track as `download_url` (ext `mp3`).
 
-TikTok only: `ladder=true` merges the full yt-dlp rung list (exact dimensions, sizes, codecs, e.g. 540p / 720p H.264 / 720p HEVC / 1080p) into the fast result. Exact rows supersede the approximate ones, duplicates and the watermarked variant are dropped, and the default download stays the IP-free HD file. Rows carry `ladder: fast|full` and `ip_free` flags; video rows carry explicit `has_audio`. Default quality is 1080p wherever a 1080 rendition exists, highest available otherwise.
+TikTok extracts always include the full quality ladder: exact yt-dlp rungs (dimensions, sizes, codecs, e.g. 540p / 720p H.264 / 720p HEVC / 1080p) merged into the fast tikwm result. Exact rows supersede the approximate ones, duplicates and the watermarked variant are dropped, and the default download stays the IP-free HD file. Rows carry `ladder: fast|full` and `ip_free` flags; video rows carry explicit `has_audio`. Only exact file sizes are ever reported. Default quality is 1080p wherever a 1080 rendition exists, highest available otherwise.
 
 Status codes: `400` unsupported URL / SSRF-blocked host / slideshow / Instagram failure (includes the cookie setup hint); `401` bad key; `409` downloading a blocked extraction; `429` rate limited; `502` CDN refused; `504` timed out (retry, cache makes retries faster).
 

@@ -285,7 +285,15 @@ def test_ladder_failure_degrades_to_fast(monkeypatch):
     assert out["download_url"] == fast["download_url"]
 
 
-def test_ladder_rejected_for_instagram():
-    r = c.get("/api/extract", params={"url": IG, "ladder": "true"}, headers=H)
-    assert r.status_code == 400
-    assert "TikTok" in r.json()["detail"]
+def test_extract_auto_merges_full_ladder(monkeypatch):
+    monkeypatch.setattr(api, "_tikwm_fetch", lambda url: _tikwm_payload())
+    ydl_info = {"title": "t", "formats": [
+        _ydl_fmt("h264_720p_1324906-0", 720, 1280, vc="h264", size=5170000, tbr=1324),
+        _ydl_fmt("bytevc1_1080p_1114895-0", 1080, 1920, vc="h265", size=4561000, tbr=1114),
+    ]}
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: ydl_info)
+    out = api.extract_sync(TT)
+    assert out["ladder"] == "full"
+    assert [v["format_id"] for v in out["formats"]["video"]] == [
+        "bytevc1_1080p_1114895-0", "h264_720p_1324906-0"]
+    assert out["download_url"] == "https://cdn/hdplay.mp4"  # default stays 1080p HD

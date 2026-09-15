@@ -326,7 +326,7 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
             "format_id": f.get("format_id"), "ext": f.get("ext"),
             "resolution": f.get("resolution") or f.get("format_note") or "unknown",
             "url": f["url"],
-            "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "filesize": f.get("filesize"),  # exact only — approximations are never shown
             "vcodec": f.get("vcodec"), "acodec": f.get("acodec"),
             "has_audio": f.get("has_audio"),  # explicit when the source states it, else null
             "height": f.get("height"), "width": f.get("width"),
@@ -479,23 +479,24 @@ def tiktok_ladder(url: str, audio_only: bool, fast: dict) -> dict:
     return out
 
 
-def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str] = None,
-                 ladder: bool = False) -> dict:
+def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str] = None) -> dict:
     platform = detect_platform(url)
     if not platform:
         raise ValueError("Unsupported URL. Only TikTok and Instagram are supported.")
 
     if platform == "tiktok":
-        # tikwm first: ~1s, HD no-watermark, IP-free CDN. yt-dlp is the
-        # fallback because TikTok's anti-bot hangs/flags server IPs often,
-        # which previously burned the whole EXTRACT_TIMEOUT budget.
+        # tikwm first: ~1s, HD no-watermark, IP-free CDN. The full yt-dlp
+        # ladder is then merged in automatically — fast enough to be default
+        # and exact enough to replace the approximate fast rows.
+        # (yt-dlp alone is the fallback: its anti-bot hangs/flags server IPs
+        # often, which previously burned the whole EXTRACT_TIMEOUT budget.)
         raw = _tikwm_fetch(url)
         if raw is not None:
             if raw.get("images") and not (raw.get("hdplay") or raw.get("play") or raw.get("wmplay")):
                 raise UnsupportedMedia("This TikTok is a photo slideshow — only video posts can be downloaded.")
             shaped = _tikwm_shape(raw, url, audio_only)
             if shaped:
-                if ladder and not audio_only:
+                if not audio_only:
                     return tiktok_ladder(url, audio_only, shaped)
                 return shaped
             # Payload parsed but unusable (no media, no images) — fall through to yt-dlp.
@@ -611,8 +612,7 @@ async def platforms():
     ]}
 
 
-async def do_extract(request: Request, url: str, audio_only: bool, custom_format: Optional[str],
-                   ladder: bool = False):
+async def do_extract(request: Request, url: str, audio_only: bool, custom_format: Optional[str]):
     ident = client_ip(request)
     if not rate_ok(ident):
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({RATE_LIMIT}/min). Slow down.")
@@ -621,10 +621,8 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     platform = detect_platform(url)
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL. Only TikTok and Instagram are supported.")
-    if ladder and platform != "tiktok":
-        raise HTTPException(status_code=400, detail="Full ladder is only available for TikTok.")
 
-    key = _ckey(_key_url(url), f"{audio_only}|{custom_format}|{ladder}")
+    key = _ckey(_key_url(url), f"{audio_only}|{custom_format}")
     cached = cache_get(key)
     if cached:
         out = dict(cached)
@@ -634,7 +632,7 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     try:
         loop = asyncio.get_running_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: extract_sync(url, audio_only, custom_format, ladder)),
+            loop.run_in_executor(None, lambda: extract_sync(url, audio_only, custom_format)),
             timeout=max(EXTRACT_TIMEOUT, 5),
         )
     except asyncio.TimeoutError:
@@ -658,9 +656,8 @@ async def extract_get(
     url: str = Query(..., min_length=8, max_length=2048),
     audio_only: bool = Query(False),
     format: Optional[str] = Query(None),
-    ladder: bool = Query(False, description="TikTok only: merge the full yt-dlp quality ladder"),
 ):
-    return await do_extract(request, url, audio_only, format, ladder)
+    return await do_extract(request, url, audio_only, format)
 
 
 @app.post("/api/extract")
@@ -673,8 +670,7 @@ async def extract_post(request: Request, body: Optional[Dict[str, Any]] = None):
     url = (body or {}).get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' in body")
-    return await do_extract(request, url, bool(body.get("audio_only")), body.get("format"),
-                            bool(body.get("ladder")))
+    return await do_extract(request, url, bool(body.get("audio_only")), body.get("format"))
 
 
 # ----------------------------------------------------------------------------
@@ -706,14 +702,14 @@ async def download(
     errors: List[str] = []
     resp = None
 
-    async def _resolve(fresh: bool, ladder: bool = False) -> dict:
-        key = _ckey(_key_url(page_url), f"False|None|{ladder}")
+    async def _resolve(fresh: bool) -> dict:
+        key = _ckey(_key_url(page_url), "False|None")
         result = None if fresh else cache_get(key)
         if not result or result.get("blocked"):
             loop = asyncio.get_running_loop()
             try:
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: extract_sync(page_url, ladder=ladder)),
+                    loop.run_in_executor(None, lambda: extract_sync(page_url)),
                     timeout=max(EXTRACT_TIMEOUT, 5),
                 )
             except asyncio.TimeoutError:
@@ -764,14 +760,6 @@ async def download(
             errors.append(str(he.detail)[:100])
             continue
         media, hdrs, cookies, found = _pick(result)
-        if not found and platform == "tiktok":
-            # Requested row lives on the full ladder — resolve it (cached when warm).
-            try:
-                result = await _resolve(label == "fresh", ladder=True)
-            except HTTPException:
-                pass
-            else:
-                media, hdrs, cookies, found = _pick(result)
         if not found:
             if label == "cached":
                 continue  # fresh resolve may list it
