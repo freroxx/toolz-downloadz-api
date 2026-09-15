@@ -207,14 +207,14 @@ def _tikwm_shape(d: dict, url: str, audio_only: bool = False) -> Optional[dict]:
               "ext": "mp4",
               "resolution": ("~1080p HD, no watermark" if hd else "~SD, no watermark"),
               "url": media, "filesize": size, "vcodec": None, "acodec": None,
-              "has_audio": True,
+              "has_audio": True, "ladder": "fast", "ip_free": True,
               "height": None, "tbr": None, "abr": None,
               "headers": dict(BASE_HEADERS), "cookies": None}]
     audio = []
     if d.get("music"):
         audio.append({"format_id": "tikwm_music", "ext": "mp3", "resolution": "audio",
                       "url": d["music"], "filesize": None, "vcodec": "none", "acodec": None,
-                      "has_audio": False,
+                      "has_audio": False, "ladder": "fast", "ip_free": True,
                       "height": None, "tbr": None, "abr": None,
                       "headers": dict(BASE_HEADERS), "cookies": None})
     author = d.get("author") or {}
@@ -237,7 +237,7 @@ def _tikwm_shape(d: dict, url: str, audio_only: bool = False) -> Optional[dict]:
                       "comment_count": _num(d.get("comment_count"))},
             "upload_date": upload_date, "description": None,
             "download_url": track["url"], "download_headers": dict(BASE_HEADERS),
-            "ext": "mp3", "blocked": False, "source": "tikwm",
+            "ext": "mp3", "blocked": False, "source": "tikwm", "ladder": "fast",
             "formats": {"video": [], "audio": audio},
             "original_url": url,
         }
@@ -252,7 +252,7 @@ def _tikwm_shape(d: dict, url: str, audio_only: bool = False) -> Optional[dict]:
                   "comment_count": _num(d.get("comment_count"))},
         "upload_date": upload_date, "description": None,
         "download_url": media, "download_headers": dict(BASE_HEADERS),
-        "ext": "mp4", "blocked": False, "source": "tikwm",
+        "ext": "mp4", "blocked": False, "source": "tikwm", "ladder": "fast",
         "formats": {"video": video, "audio": audio},
         "original_url": url,
     }
@@ -314,6 +314,14 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
         proto = f.get("protocol") or ""
         if "m3u8" in proto or f.get("ext") == "m3u8" or ".m3u8" in f["url"]:
             continue
+        # Skip fragmented/DASH entries — segment lists, not single files.
+        # Without ffmpeg they can't be served as downloads, so listing them lies.
+        if f.get("fragments"):
+            continue
+        # Skip watermarked variants — everything served here is no-watermark.
+        note = f"{f.get('format_note') or ''} {f.get('format_id') or ''}".lower()
+        if "watermark" in note:
+            continue
         fmt = {
             "format_id": f.get("format_id"), "ext": f.get("ext"),
             "resolution": f.get("resolution") or f.get("format_note") or "unknown",
@@ -321,7 +329,8 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
             "filesize": f.get("filesize") or f.get("filesize_approx"),
             "vcodec": f.get("vcodec"), "acodec": f.get("acodec"),
             "has_audio": f.get("has_audio"),  # explicit when the source states it, else null
-            "height": f.get("height"), "tbr": f.get("tbr"), "abr": f.get("abr"),
+            "height": f.get("height"), "width": f.get("width"),
+            "tbr": f.get("tbr"), "abr": f.get("abr"), "fps": f.get("fps"),
             "headers": dict(f.get("http_headers") or {}),
             "cookies": f.get("cookies"),  # TikTok needs ttwid etc. per-format
         }
@@ -335,7 +344,31 @@ def normalize(info: dict) -> Tuple[List[dict], List[dict]]:
 
     video.sort(key=vh, reverse=True)
     audio.sort(key=ah, reverse=True)
-    return video, audio
+    return _dedupe(video, ("width", "height", "vcodec", "acodec")), _dedupe(audio, ("acodec", "abr"))
+
+
+def _dedupe(rows: List[dict], keys: Tuple[str, ...]) -> List[dict]:
+    """Collapse same-spec rows (IG duplicate encodes, TikTok -0/-1 pairs).
+
+    Keeps the entry with a known filesize, else highest bitrate, else first.
+    """
+    best: Dict[tuple, dict] = {}
+
+    def score(r):
+        return (1 if r.get("filesize") else 0, r.get("tbr") or r.get("abr") or 0)
+
+    for r in rows:
+        k = tuple(r.get(c) for c in keys)
+        if k not in best or score(r) > score(best[k]):
+            best[k] = r
+    ordered = sorted(best.values(), key=lambda r: rows.index(r))
+    return ordered
+
+
+def prefer_1080(rows: List[dict]) -> List[dict]:
+    """1080p first when present, otherwise keep existing (highest-first) order."""
+    exact = [r for r in rows if (r.get("height") or 0) == 1080]
+    return (exact + [r for r in rows if r not in exact]) if exact else rows
 
 
 def shape(platform: str, info: dict, original_url: str) -> dict:
@@ -353,7 +386,8 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
         dl_cookies = pick.get("cookies")
     if not dl:
         merged = [f for f in video if f["vcodec"] not in (None, "none") and f["acodec"] not in (None, "none")]
-        pick = merged or video or audio
+        # Default is 1080p: exact match wins, else highest available.
+        pick = prefer_1080(merged or video or audio)
         if pick:
             dl, hdrs = pick[0]["url"], dict(pick[0]["headers"] or {})
     stats = {k: info.get(k) for k in
@@ -405,7 +439,48 @@ BLOCK_MSGS = {
 # ----------------------------------------------------------------------------
 # Core extraction orchestration
 # ----------------------------------------------------------------------------
-def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str] = None) -> dict:
+def tiktok_ladder(url: str, audio_only: bool, fast: dict) -> dict:
+    """
+    Merge exact yt-dlp rungs into a fast tikwm result (on-demand full ladder).
+
+    Exact rows supersede the approximate tikwm video rows (same files, observed
+    specs) — no duplicate 1080p entries. The default download stays the IP-free
+    tikwm HD file. Failures degrade to the fast result with ladder_error set.
+    """
+    try:
+        info = run_ydl(ydl_opts("tiktok", audio_only), tiktok_canonical(url))
+    except Exception as e:
+        out = dict(fast)
+        out["ladder"] = "fast"
+        out["ladder_error"] = str(e).replace("ERROR: ", "")[:160]
+        return out
+    video, audio = normalize(info)
+    for r in video + audio:
+        r["ladder"] = "full"
+        r["ip_free"] = False
+    out = dict(fast)
+    fast_audio = fast.get("formats", {}).get("audio", [])
+    if fast_audio:
+        # tikwm already serves the sound (IP-free) — the yt-dlp audio row is
+        # the same track on a signed CDN, not a real choice.
+        merged_audio = fast_audio
+    else:
+        seen = {(a.get("acodec"), a.get("abr")) for a in fast_audio}
+        merged_audio = fast_audio + [a for a in audio if (a.get("acodec"), a.get("abr")) not in seen]
+    out["formats"] = {
+        "video": video[:20] or fast.get("formats", {}).get("video", []),
+        "audio": merged_audio[:10],
+    }
+    if video:
+        out["ladder"] = "full"
+    else:
+        out["ladder"] = "fast"
+        out["ladder_error"] = "Full ladder unavailable — showing fast qualities."
+    return out
+
+
+def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str] = None,
+                 ladder: bool = False) -> dict:
     platform = detect_platform(url)
     if not platform:
         raise ValueError("Unsupported URL. Only TikTok and Instagram are supported.")
@@ -420,6 +495,8 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
                 raise UnsupportedMedia("This TikTok is a photo slideshow — only video posts can be downloaded.")
             shaped = _tikwm_shape(raw, url, audio_only)
             if shaped:
+                if ladder and not audio_only:
+                    return tiktok_ladder(url, audio_only, shaped)
                 return shaped
             # Payload parsed but unusable (no media, no images) — fall through to yt-dlp.
         last = None
@@ -534,7 +611,8 @@ async def platforms():
     ]}
 
 
-async def do_extract(request: Request, url: str, audio_only: bool, custom_format: Optional[str]):
+async def do_extract(request: Request, url: str, audio_only: bool, custom_format: Optional[str],
+                   ladder: bool = False):
     ident = client_ip(request)
     if not rate_ok(ident):
         raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({RATE_LIMIT}/min). Slow down.")
@@ -543,8 +621,10 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     platform = detect_platform(url)
     if not platform:
         raise HTTPException(status_code=400, detail="Unsupported URL. Only TikTok and Instagram are supported.")
+    if ladder and platform != "tiktok":
+        raise HTTPException(status_code=400, detail="Full ladder is only available for TikTok.")
 
-    key = _ckey(_key_url(url), f"{audio_only}|{custom_format}")
+    key = _ckey(_key_url(url), f"{audio_only}|{custom_format}|{ladder}")
     cached = cache_get(key)
     if cached:
         out = dict(cached)
@@ -554,7 +634,7 @@ async def do_extract(request: Request, url: str, audio_only: bool, custom_format
     try:
         loop = asyncio.get_running_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: extract_sync(url, audio_only, custom_format)),
+            loop.run_in_executor(None, lambda: extract_sync(url, audio_only, custom_format, ladder)),
             timeout=max(EXTRACT_TIMEOUT, 5),
         )
     except asyncio.TimeoutError:
@@ -578,8 +658,9 @@ async def extract_get(
     url: str = Query(..., min_length=8, max_length=2048),
     audio_only: bool = Query(False),
     format: Optional[str] = Query(None),
+    ladder: bool = Query(False, description="TikTok only: merge the full yt-dlp quality ladder"),
 ):
-    return await do_extract(request, url, audio_only, format)
+    return await do_extract(request, url, audio_only, format, ladder)
 
 
 @app.post("/api/extract")
@@ -592,7 +673,8 @@ async def extract_post(request: Request, body: Optional[Dict[str, Any]] = None):
     url = (body or {}).get("url")
     if not url:
         raise HTTPException(status_code=400, detail="Missing 'url' in body")
-    return await do_extract(request, url, bool(body.get("audio_only")), body.get("format"))
+    return await do_extract(request, url, bool(body.get("audio_only")), body.get("format"),
+                            bool(body.get("ladder")))
 
 
 # ----------------------------------------------------------------------------
@@ -624,14 +706,14 @@ async def download(
     errors: List[str] = []
     resp = None
 
-    async def _resolve(fresh: bool) -> dict:
-        key = _ckey(_key_url(page_url), "False|None")
+    async def _resolve(fresh: bool, ladder: bool = False) -> dict:
+        key = _ckey(_key_url(page_url), f"False|None|{ladder}")
         result = None if fresh else cache_get(key)
         if not result or result.get("blocked"):
             loop = asyncio.get_running_loop()
             try:
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: extract_sync(page_url)),
+                    loop.run_in_executor(None, lambda: extract_sync(page_url, ladder=ladder)),
                     timeout=max(EXTRACT_TIMEOUT, 5),
                 )
             except asyncio.TimeoutError:
@@ -649,17 +731,18 @@ async def download(
     def _pick(result):
         headers = dict(result.get("download_headers") or {})
         cookies = result.get("download_cookies")
-        if f != "best" and f:
+        found = f == "best" or not f
+        if not found:
             for group in ("video", "audio"):
                 for fmt in result.get("formats", {}).get(group, []):
                     if str(fmt.get("format_id")) == f:
-                        return fmt["url"], dict(fmt.get("headers") or {}), fmt.get("cookies")
+                        return fmt["url"], dict(fmt.get("headers") or {}), fmt.get("cookies"), True
         media = result.get("download_url")
         if media and not headers:
             vids = result.get("formats", {}).get("video") or []
             if vids:
                 headers = dict(vids[0].get("headers") or {})
-        return media, headers, cookies
+        return media, headers, cookies, found
 
     def _sync_open(media_url, h):
         req = urllib.request.Request(media_url, headers=h)
@@ -680,7 +763,19 @@ async def download(
                 raise
             errors.append(str(he.detail)[:100])
             continue
-        media, hdrs, cookies = _pick(result)
+        media, hdrs, cookies, found = _pick(result)
+        if not found and platform == "tiktok":
+            # Requested row lives on the full ladder — resolve it (cached when warm).
+            try:
+                result = await _resolve(label == "fresh", ladder=True)
+            except HTTPException:
+                pass
+            else:
+                media, hdrs, cookies, found = _pick(result)
+        if not found:
+            if label == "cached":
+                continue  # fresh resolve may list it
+            raise HTTPException(status_code=404, detail="That quality is no longer listed. Extract again.")
         if not media:
             continue
         h = dict(hdrs)

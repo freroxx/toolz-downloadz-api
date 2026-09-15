@@ -188,3 +188,104 @@ def test_post_empty_body_reports_missing_url():
     r = c.post("/api/extract", json={}, headers=H)
     assert r.status_code == 400
     assert "Missing 'url'" in r.json()["detail"]
+
+
+# --- Quality ladder: dedupe, fragments, 1080p default ------------------------
+
+def _ydl_fmt(fid, w, h, vc="avc1", ac="mp4a", size=None, tbr=None, **over):
+    f = {"format_id": fid, "ext": "mp4", "url": f"https://cdn/{fid}.mp4",
+         "resolution": f"{w}x{h}", "width": w, "height": h,
+         "vcodec": vc, "acodec": ac, "filesize": size,
+         "filesize_approx": None, "tbr": tbr, "abr": None, "fps": 30,
+         "protocol": "https", "http_headers": {}, "cookies": None}
+    f.update(over)
+    return f
+
+
+def test_dedupe_collapses_identical_specs():
+    info = {"formats": [
+        _ydl_fmt("0", 720, 1280, size=1000),
+        _ydl_fmt("1", 720, 1280, size=1000),   # IG duplicate encode
+        _ydl_fmt("2", 1080, 1920, size=2000),
+    ]}
+    video, _ = api.normalize(info)
+    assert [(v["width"], v["height"]) for v in video] == [(1080, 1920), (720, 1280)]
+
+
+def test_dedupe_keeps_distinct_codecs():
+    info = {"formats": [
+        _ydl_fmt("h264_720p-0", 720, 1280, vc="h264", size=5000, tbr=1324),
+        _ydl_fmt("bytevc1_720p-0", 720, 1280, vc="h265", size=2600, tbr=683),
+    ]}
+    video, _ = api.normalize(info)
+    assert len(video) == 2  # same dims, different codec = real choice
+
+
+def test_tiktok_pair_suffixes_deduped():
+    info = {"formats": [
+        _ydl_fmt("h264_720p_1324906-0", 720, 1280, vc="h264", size=5170000, tbr=1324),
+        _ydl_fmt("h264_720p_1324906-1", 720, 1280, vc="h264", size=5170000, tbr=1324),
+    ]}
+    video, _ = api.normalize(info)
+    assert len(video) == 1
+
+
+def test_fragments_and_watermarked_dropped():
+    info = {"formats": [
+        _ydl_fmt("dash-v", 720, 1280, fragments=[{"url": "x"}]),
+        _ydl_fmt("download", 720, 1280, format_note="Untested, watermarked"),
+        _ydl_fmt("h264_720p-0", 720, 1280, vc="h264", size=1000),
+    ]}
+    video, _ = api.normalize(info)
+    assert [v["format_id"] for v in video] == ["h264_720p-0"]
+
+
+def test_best_prefers_1080p():
+    info = {"title": "t", "formats": [
+        _ydl_fmt("720p", 720, 1280, size=9000, tbr=5000),   # higher bitrate, lower res
+        _ydl_fmt("1080p", 1080, 1920, size=4000, tbr=1114),
+        _ydl_fmt("540p", 576, 1024, size=2000, tbr=577),
+    ]}
+    out = api.shape("instagram", info, IG)
+    assert out["download_url"] == "https://cdn/1080p.mp4"
+
+
+def test_best_falls_back_to_highest_without_1080():
+    info = {"title": "t", "formats": [
+        _ydl_fmt("480p", 480, 854, size=1000, tbr=400),
+        _ydl_fmt("720p", 720, 1280, size=3000, tbr=900),
+    ]}
+    out = api.shape("instagram", info, IG)
+    assert out["download_url"] == "https://cdn/720p.mp4"
+
+
+def test_ladder_merges_exact_rows_and_keeps_hd_default(monkeypatch):
+    fast = api._tikwm_shape(_tikwm_payload(), TT)
+    ydl_info = {"title": "t", "formats": [
+        _ydl_fmt("h264_720p_1324906-0", 720, 1280, vc="h264", size=5170000, tbr=1324),
+        _ydl_fmt("h264_720p_1324906-1", 720, 1280, vc="h264", size=5170000, tbr=1324),
+        _ydl_fmt("bytevc1_1080p_1114895-0", 1080, 1920, vc="h265", size=4561000, tbr=1114),
+        _ydl_fmt("download", 720, 1280, format_note="Untested, watermarked"),
+    ]}
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: ydl_info)
+    out = api.tiktok_ladder(TT, False, fast)
+    assert out["ladder"] == "full"
+    assert out["download_url"] == "https://cdn/hdplay.mp4"  # default stays IP-free HD
+    vids = out["formats"]["video"]
+    assert [v["format_id"] for v in vids] == ["bytevc1_1080p_1114895-0", "h264_720p_1324906-0"]
+    assert all(v["ladder"] == "full" and v["ip_free"] is False for v in vids)
+    assert all("watermark" not in (v.get("resolution") or "").lower() for v in vids)
+
+
+def test_ladder_failure_degrades_to_fast(monkeypatch):
+    fast = api._tikwm_shape(_tikwm_payload(), TT)
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: (_ for _ in ()).throw(Exception("blocked")))
+    out = api.tiktok_ladder(TT, False, fast)
+    assert out["ladder"] == "fast" and "ladder_error" in out
+    assert out["download_url"] == fast["download_url"]
+
+
+def test_ladder_rejected_for_instagram():
+    r = c.get("/api/extract", params={"url": IG, "ladder": "true"}, headers=H)
+    assert r.status_code == 400
+    assert "TikTok" in r.json()["detail"]
