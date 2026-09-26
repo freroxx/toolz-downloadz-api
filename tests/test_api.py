@@ -19,7 +19,7 @@ def test_health():
     r = c.get("/api/health")
     assert r.status_code == 200
     j = r.json()
-    assert j["status"] == "online" and j["version"].startswith("4.")
+    assert j["status"] == "online" and j["version"].startswith("5.")
     assert set(j["platforms"]) == {"tiktok", "instagram"}
 
 
@@ -157,11 +157,35 @@ def test_tikwm_audio_only_without_music_keeps_video():
     assert out["ext"] == "mp4" and out["download_url"]
 
 
-def test_slideshow_raises_clean_error(monkeypatch):
+def test_slideshow_becomes_ordered_gallery(monkeypatch):
     monkeypatch.setattr(api, "_tikwm_fetch",
                         lambda url: {"images": ["https://cdn/1.jpg"], "title": "pics"})
-    with pytest.raises(RuntimeError, match="slideshow"):
-        api.extract_sync("https://www.tiktok.com/@u/video/123")
+    out = api.extract_sync("https://www.tiktok.com/@u/video/123")
+    assert out["gallery"][0]["format_id"] == "gallery:0"
+
+
+def test_v1_detects_only_real_registered_domains():
+    assert api.detect_v1_platform("https://youtu.be/dQw4w9WgXcQ") == "youtube"
+    assert api.detect_v1_platform("https://not-tiktok.com/@u/video/1") is None
+    assert api.detect_v1_platform("https://instagram.com.evil.test/reel/x") is None
+
+
+def test_v1_session_and_extraction_hide_upstream_urls(monkeypatch):
+    session = c.post("/api/v1/client-sessions", json={"installation_id": "device-identifier-1234"})
+    assert session.status_code == 200
+    token = session.json()["access_token"]
+    fake = api._tikwm_shape(_tikwm_payload(), TT)
+    monkeypatch.setattr(api, "extract_v1_sync", lambda url, audio_only=False: fake)
+    response = c.post("/api/v1/extractions", json={"url": TT}, headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["assets"] and all("url" not in asset for asset in payload["assets"])
+    assert payload["assets"][0]["download_path"].startswith("/api/v1/extractions/")
+
+
+def test_v1_rejects_missing_or_expired_session():
+    r = c.post("/api/v1/extractions", json={"url": TT})
+    assert r.status_code == 401
 
 
 def test_client_ip_prefers_forwarded_for():

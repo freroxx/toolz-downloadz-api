@@ -1,6 +1,6 @@
 # toolz-downloadz-api
 
-Media-extraction API for TikTok and Instagram. FastAPI + yt-dlp, built for Vercel serverless.
+Media-extraction API for public TikTok, Instagram, and YouTube media. FastAPI + yt-dlp, built for Vercel serverless.
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ffreroxx%2Ftoolz-downloadz-api&env=API_SECRET_KEY,INSTAGRAM_COOKIES)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
@@ -21,7 +21,19 @@ GET /api/download?u=…&f=best
   server's IP, so a separate proxy gets 403.
 ```
 
-TikTok photo slideshows are rejected with a plain 400 (only video posts can be downloaded). No YouTube support, no transcoding (Vercel has no ffmpeg), one URL at a time.
+The v1 API supports individual gallery images as ordered assets, as well as native source video and audio formats. It does not transcode or mux on Vercel.
+
+## v1 client contract
+
+New Android and web clients must use v1. It never exposes upstream media URLs,
+cookies, or a project API secret:
+
+1. `POST /api/v1/client-sessions` with an opaque, stable installation ID.
+2. `POST /api/v1/extractions` with `Authorization: Bearer <guest token>` and a public URL.
+3. Select an opaque `assets[].id` and download it at its returned `download_path` with the same bearer token.
+
+Guest tokens and extraction handles are short-lived. In production set
+`UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`; in-memory state is intended only for local development. `/api/extract` and `/api/download` remain legacy compatibility routes during client rollout.
 
 Tikwm reports byte counts and duration but no dimensions or codecs, so TikTok quality labels are approximate and carry a `~` prefix. Anything unobserved is `null`, never guessed.
 
@@ -42,6 +54,7 @@ Tikwm reports byte counts and duration but no dimensions or codecs, so TikTok qu
 | `EXTRACT_TIMEOUT` | no | `26` | Seconds before extraction gives up. |
 | `CACHE_TTL` | no | `3600` | Cache seconds for successful extractions (in-memory, per instance). |
 | `RATE_LIMIT` | no | `30` | Requests per minute per IP (uses `X-Forwarded-For` behind Vercel). |
+| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | v1 production | — | Upstash Redis REST state for sessions and short-lived extraction handles. |
 
 Instagram cookies: log in to instagram.com, export with "Get cookies.txt LOCALLY", paste the whole file content as the var, redeploy. Never commit cookies; the API only reads them into `/tmp` for yt-dlp.
 

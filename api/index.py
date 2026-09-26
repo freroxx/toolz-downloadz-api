@@ -12,6 +12,8 @@ import time
 import json
 import asyncio
 import hashlib
+import ipaddress
+import secrets
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -44,18 +46,75 @@ def _int_env(name: str, default: int) -> int:
 EXTRACT_TIMEOUT = _int_env("EXTRACT_TIMEOUT", 26)    # seconds; fits maxDuration=60
 CACHE_TTL = _int_env("CACHE_TTL", 3600)
 RATE_LIMIT = _int_env("RATE_LIMIT", 30)              # per minute per IP
-VERSION = "4.1.0"
+GUEST_SESSION_TTL = _int_env("GUEST_SESSION_TTL", 60 * 60 * 24 * 14)
+EXTRACTION_TTL = _int_env("EXTRACTION_TTL", 60 * 10)
+VERSION = "5.0.0"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 BASE_HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 
 SUPPORTED = ["tiktok", "instagram"]
+V1_SUPPORTED = ["tiktok", "instagram", "youtube"]
 
 # ----------------------------------------------------------------------------
 # Tiny in-memory cache + rate limiter (per-lambda; zero infra)
 # ----------------------------------------------------------------------------
 _cache: Dict[str, Tuple[float, dict]] = {}
+
+# The v1 contract needs state that can survive a cold serverless invocation.
+# Upstash Redis REST is the production store. The legacy KV names remain only
+# as a rollout fallback for an existing Vercel KV configuration.
+REDIS_REST_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL") or "").rstrip("/")
+REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN", "")
+_state: Dict[str, Tuple[float, dict]] = {}
+
+
+def state_get(key: str) -> Optional[dict]:
+    """Read JSON state from managed KV, with a tiny local-dev fallback."""
+    if REDIS_REST_URL and REDIS_REST_TOKEN:
+        try:
+            req = urllib.request.Request(
+                REDIS_REST_URL,
+                data=json.dumps(["GET", key]).encode(),
+                headers={"Authorization": f"Bearer {REDIS_REST_TOKEN}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3) as res:
+                value = json.loads(res.read().decode()).get("result")
+            return json.loads(value) if value else None
+        except Exception:
+            # Availability must not turn a valid request into a 500. Monitoring
+            # still receives the exception through the route-level reporter.
+            return None
+    hit = _state.get(key)
+    if not hit:
+        return None
+    expires_at, value = hit
+    if expires_at <= time.time():
+        _state.pop(key, None)
+        return None
+    return value
+
+
+def state_set(key: str, value: dict, ttl: int) -> None:
+    if REDIS_REST_URL and REDIS_REST_TOKEN:
+        try:
+            req = urllib.request.Request(
+                REDIS_REST_URL,
+                data=json.dumps(["SET", key, json.dumps(value, separators=(",", ":")), "EX", max(1, ttl)]).encode(),
+                headers={"Authorization": f"Bearer {REDIS_REST_TOKEN}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3):
+                pass
+            return
+        except Exception:
+            return
+    if len(_state) > 500:
+        for stale in sorted(_state, key=lambda k: _state[k][0])[:100]:
+            _state.pop(stale, None)
+    _state[key] = (time.time() + max(1, ttl), value)
 
 
 def _ckey(url: str, opts: str) -> str:
@@ -126,14 +185,34 @@ class UnsupportedMedia(RuntimeError):
 
 
 # ----------------------------------------------------------------------------
-# Platform detection — strict allowlist (TikTok + Instagram only)
+# Platform detection — strict registered-domain allowlist
 # ----------------------------------------------------------------------------
+def _host_is(host: str, domain: str) -> bool:
+    return host == domain or host.endswith("." + domain)
+
+
+def _source_host(url: str) -> str:
+    return (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
+
+
 def detect_platform(url: str) -> Optional[str]:
-    u = url.lower()
-    if "tiktok.com" in u:
+    host = _source_host(url)
+    if _host_is(host, "tiktok.com"):
         return "tiktok"
-    if "instagram.com" in u and ("/reel" in u or "/reels" in u or "/p/" in u):
+    path = urllib.parse.urlparse(url).path.lower()
+    if _host_is(host, "instagram.com") and (path.startswith("/reel") or path.startswith("/reels") or path.startswith("/p/")):
         return "instagram"
+    return None
+
+
+def detect_v1_platform(url: str) -> Optional[str]:
+    """v1 adds YouTube without broad substring matching or lookalike hosts."""
+    legacy = detect_platform(url)
+    if legacy:
+        return legacy
+    host = _source_host(url)
+    if _host_is(host, "youtube.com") or host == "youtu.be":
+        return "youtube"
     return None
 
 
@@ -293,6 +372,11 @@ def ydl_opts(platform: str, audio_only: bool = False,
         if cf:
             opts["cookiefile"] = cf
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
+    elif platform == "youtube":
+        # Never promise server-side muxing on Vercel.  Native muxed and
+        # separate source rows are surfaced honestly by normalize().
+        opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
     return opts
 
 
@@ -419,6 +503,64 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
     }
 
 
+def gallery_shape(platform: str, info: dict, original_url: str) -> Optional[dict]:
+    """Normalize playlist/carousel entries into ordered, individually downloadable assets."""
+    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+    if not entries:
+        return None
+    gallery = []
+    for index, entry in enumerate(entries):
+        media = entry.get("url")
+        headers = dict(entry.get("http_headers") or {})
+        cookies = entry.get("cookies")
+        if not media:
+            video, audio = normalize(entry)
+            choice = (video or audio or [None])[0]
+            if choice:
+                media, headers, cookies = choice["url"], dict(choice.get("headers") or {}), choice.get("cookies")
+        if not media:
+            continue
+        ext = entry.get("ext") or urllib.parse.urlparse(media).path.rsplit(".", 1)[-1] or "jpg"
+        gallery.append({
+            "format_id": f"gallery:{index}", "url": media, "headers": headers, "cookies": cookies,
+            "ext": ext.lower(), "filesize": entry.get("filesize"), "width": entry.get("width"),
+            "height": entry.get("height"), "thumbnail": entry.get("thumbnail") or media,
+            "mime_type": entry.get("mime_type"),
+        })
+    if not gallery:
+        return None
+    first = gallery[0]
+    return {
+        "platform": platform, "title": info.get("title"), "thumbnail": info.get("thumbnail") or first["thumbnail"],
+        "duration": None, "uploader": info.get("uploader"), "uploader_url": info.get("uploader_url"),
+        "stats": {k: info.get(k) for k in ("view_count", "like_count", "comment_count")},
+        "upload_date": info.get("upload_date"), "description": (info.get("description") or "")[:400] or None,
+        "download_url": first["url"], "download_headers": first["headers"], "download_cookies": first["cookies"],
+        "ext": first["ext"], "blocked": False, "formats": {"video": [], "audio": []},
+        "gallery": gallery, "original_url": original_url,
+    }
+
+
+def tiktok_gallery_shape(data: dict, url: str) -> Optional[dict]:
+    images = [image for image in (data.get("images") or []) if isinstance(image, str) and image.startswith("http")]
+    if not images:
+        return None
+    author = data.get("author") or {}
+    gallery = [{
+        "format_id": f"gallery:{index}", "url": image, "headers": dict(BASE_HEADERS), "cookies": None,
+        "ext": urllib.parse.urlparse(image).path.rsplit(".", 1)[-1].lower() or "jpg", "filesize": None,
+        "width": None, "height": None, "thumbnail": image, "mime_type": None,
+    } for index, image in enumerate(images)]
+    return {
+        "platform": "tiktok", "title": data.get("title"), "thumbnail": data.get("cover") or gallery[0]["thumbnail"],
+        "duration": None, "uploader": author.get("nickname"), "uploader_url": None,
+        "stats": {"view_count": _num(data.get("play_count")), "like_count": _num(data.get("digg_count")), "comment_count": _num(data.get("comment_count"))},
+        "upload_date": None, "description": None, "download_url": gallery[0]["url"],
+        "download_headers": dict(BASE_HEADERS), "download_cookies": None, "ext": gallery[0]["ext"],
+        "blocked": False, "formats": {"video": [], "audio": []}, "gallery": gallery, "original_url": url,
+    }
+
+
 def blocked_shape(platform: str, meta: dict, original_url: str, msg: str) -> dict:
     return {
         "platform": platform, "title": meta.get("title"), "thumbnail": meta.get("thumbnail"),
@@ -493,7 +635,10 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         raw = _tikwm_fetch(url)
         if raw is not None:
             if raw.get("images") and not (raw.get("hdplay") or raw.get("play") or raw.get("wmplay")):
-                raise UnsupportedMedia("This TikTok is a photo slideshow — only video posts can be downloaded.")
+                gallery = tiktok_gallery_shape(raw, url)
+                if gallery:
+                    return gallery
+                raise UnsupportedMedia("This TikTok photo post did not expose downloadable images.")
             shaped = _tikwm_shape(raw, url, audio_only)
             if shaped:
                 if not audio_only:
@@ -514,14 +659,28 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
             return blocked_shape("tiktok", meta, url, BLOCK_MSGS["tiktok"])
         raise RuntimeError(f"TikTok extraction failed: {(last or 'unknown')[:300]}")
 
-    # instagram reels / posts
+    # Instagram reels / posts. yt-dlp represents carousel posts as playlist
+    # entries, which become ordered individual assets rather than a fake video.
     try:
-        return shape(platform, run_ydl(ydl_opts("instagram", audio_only, custom_format), url), url)
+        info = run_ydl(ydl_opts("instagram", audio_only, custom_format), url)
+        return gallery_shape(platform, info, url) or shape(platform, info, url)
     except Exception as e:
         msg = str(e).replace("ERROR: ", "").split(" Check if this post")[0].strip()
         hint = ("Instagram requires login for most content on server IPs. "
                 "Set INSTAGRAM_COOKIES env (Netscape cookies.txt from a logged-in browser) and redeploy.")
         raise RuntimeError(f"{msg[:250]} ({hint})")
+
+
+def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
+    """Versioned extraction entry point. Legacy routes remain TikTok/IG-only."""
+    platform = detect_v1_platform(url)
+    if platform == "youtube":
+        try:
+            info = run_ydl(ydl_opts("youtube", audio_only), url)
+            return gallery_shape(platform, info, url) or shape(platform, info, url)
+        except Exception as exc:
+            raise RuntimeError(f"YouTube extraction failed: {str(exc).replace('ERROR: ', '')[:260]}")
+    return extract_sync(url, audio_only)
 
 
 # ----------------------------------------------------------------------------
@@ -549,18 +708,144 @@ def check_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized: invalid or missing API key")
 
 
+def _guest_key(token: str) -> str:
+    return "downloadz:v1:guest:" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def _extraction_key(extraction_id: str) -> str:
+    return "downloadz:v1:extraction:" + extraction_id
+
+
+def issue_guest_session(installation_id: str, request: Request) -> dict:
+    installation_id = (installation_id or "").strip()
+    if len(installation_id) < 16 or len(installation_id) > 128:
+        raise HTTPException(status_code=400, detail="installation_id must be 16–128 characters")
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    state_set(_guest_key(token), {
+        "installation_hash": hashlib.sha256(installation_id.encode()).hexdigest(),
+        "ip": client_ip(request), "created_at": now, "expires_at": now + GUEST_SESSION_TTL,
+    }, GUEST_SESSION_TTL)
+    return {"access_token": token, "token_type": "Bearer", "expires_in": GUEST_SESSION_TTL}
+
+
+def require_guest_session(request: Request) -> Tuple[str, dict]:
+    auth = request.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="A guest session bearer token is required")
+    token = auth[7:].strip()
+    if len(token) < 32:
+        raise HTTPException(status_code=401, detail="Invalid guest session")
+    session = state_get(_guest_key(token))
+    if not session or int(session.get("expires_at", 0)) <= time.time():
+        raise HTTPException(status_code=401, detail="Guest session expired. Create a new session.")
+    return token, session
+
+
+def _mime_type(ext: Optional[str], kind: str) -> str:
+    e = (ext or "").lower()
+    if e in {"jpg", "jpeg"}:
+        return "image/jpeg"
+    if e == "png":
+        return "image/png"
+    if e == "webp":
+        return "image/webp"
+    if e == "gif":
+        return "image/gif"
+    if e in {"mp3", "mpeg"}:
+        return "audio/mpeg"
+    if e in {"m4a", "mp4a"}:
+        return "audio/mp4"
+    if e in {"webm", "opus"} and kind == "audio":
+        return "audio/webm"
+    if e == "webm":
+        return "video/webm"
+    return "video/mp4" if kind == "video" else "application/octet-stream"
+
+
+def _asset_record(asset_id: str, kind: str, fmt: dict, source_format: str) -> dict:
+    return {
+        "id": asset_id, "kind": kind, "format": source_format,
+        "ext": fmt.get("ext") or ("jpg" if kind == "image" else "mp4"),
+        "mime_type": fmt.get("mime_type") or _mime_type(fmt.get("ext"), kind),
+        "filesize": fmt.get("filesize"), "width": fmt.get("width"), "height": fmt.get("height"),
+        "duration": fmt.get("duration"), "resolution": fmt.get("resolution"),
+        "vcodec": fmt.get("vcodec"), "acodec": fmt.get("acodec"),
+        "has_audio": fmt.get("has_audio"), "thumbnail": fmt.get("thumbnail"),
+    }
+
+
+def make_v1_extraction(source_url: str, result: dict, owner_installation_hash: str) -> dict:
+    """Persist private upstream details but return only opaque asset handles."""
+    extraction_id = secrets.token_urlsafe(18)
+    asset_map: Dict[str, dict] = {}
+    best = {
+        "ext": result.get("ext"), "filesize": None, "duration": result.get("duration"),
+        "has_audio": not bool(result.get("gallery")), "thumbnail": result.get("thumbnail"),
+    }
+    asset_map["best"] = _asset_record("best", "video", best, "best")
+    for group, kind in (("video", "video"), ("audio", "audio")):
+        for index, fmt in enumerate(result.get("formats", {}).get(group, [])):
+            fmt_id = str(fmt.get("format_id") or "")
+            if not fmt_id or not fmt.get("url"):
+                continue
+            asset_id = f"{kind[0]}_{index}_{hashlib.sha256(fmt_id.encode()).hexdigest()[:8]}"
+            asset_map[asset_id] = _asset_record(asset_id, kind, fmt, fmt_id)
+    for index, item in enumerate(result.get("gallery", [])):
+        if not item.get("url"):
+            continue
+        asset_id = f"i_{index}"
+        asset_map[asset_id] = _asset_record(asset_id, "image", item, str(item.get("format_id") or f"gallery:{index}"))
+    # A gallery has no meaningful generic "best" file; clients receive only
+    # its ordered images and cannot accidentally download the first item twice.
+    if result.get("gallery"):
+        asset_map.pop("best", None)
+    now = int(time.time())
+    record = {
+        "id": extraction_id, "owner": owner_installation_hash,
+        "created_at": now, "expires_at": now + EXTRACTION_TTL, "source_url": source_url,
+        "result": result, "assets": asset_map,
+    }
+    state_set(_extraction_key(extraction_id), record, EXTRACTION_TTL)
+    return record
+
+
+def public_v1_extraction(record: dict) -> dict:
+    result, extraction_id = record["result"], record["id"]
+    assets = []
+    for asset in record["assets"].values():
+        public = {k: v for k, v in asset.items() if k != "format"}
+        public["download_path"] = f"/api/v1/extractions/{extraction_id}/assets/{asset['id']}/download"
+        assets.append(public)
+    kind_order = {"video": 0, "audio": 1, "image": 2}
+    assets.sort(key=lambda item: (kind_order.get(item["kind"], 9), item["id"]))
+    return {
+        "id": extraction_id, "status": "ready", "expires_at": record["expires_at"],
+        "platform": result.get("platform"), "title": result.get("title"), "thumbnail": result.get("thumbnail"),
+        "duration": result.get("duration"), "uploader": result.get("uploader"), "uploader_url": result.get("uploader_url"),
+        "stats": result.get("stats") or {}, "description": result.get("description"),
+        "media_kind": "gallery" if result.get("gallery") else "media", "assets": assets,
+    }
+
+
 def clean_url(url: str) -> str:
     url = (url or "").strip()
-    if not url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    if not url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="URL must start with https://")
     if len(url) > 2048:
         raise HTTPException(status_code=400, detail="URL too long")
-    host = urllib.parse.urlparse(url).hostname or ""
-    if host.split(":")[0] in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or \
-       host.endswith((".local", ".internal")) or host.startswith(("10.", "192.168.", "169.254.")) or \
-       host.startswith("172.16.") or host.startswith("172.17.") or host.startswith("172.18.") or \
-       host.startswith("172.19.") or host.startswith("172.2") or host.startswith("172.30.") or host.startswith("172.31."):
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="Invalid source URL")
+    if host in ("localhost",) or host.endswith((".local", ".internal")):
         raise HTTPException(status_code=400, detail="Private/internal hosts are not allowed")
+    try:
+        address = ipaddress.ip_address(host)
+        if not address.is_global:
+            raise HTTPException(status_code=400, detail="Private/internal hosts are not allowed")
+    except ValueError:
+        pass
     return url
 
 
@@ -584,7 +869,10 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": f"Internal error: {str(exc)[:200]}"})
+    # Do not leak provider URLs, cookie failures, or implementation details to
+    # public clients. Vercel captures this structured log for alerting.
+    print(json.dumps({"event": "unhandled_error", "path": request.url.path, "type": type(exc).__name__}))
+    return JSONResponse(status_code=500, content={"detail": "The download service encountered an unexpected error. Please retry."})
 
 
 @app.get("/api/health")
@@ -594,8 +882,8 @@ async def health():
         "service": "toolz-downloadz-api",
         "version": VERSION,
         "platforms": SUPPORTED,
-        "auth": bool(API_SECRET_KEY),
-        "cookies": {"instagram": bool(INSTAGRAM_COOKIES)},
+        "api_versions": ["legacy", "v1"],
+        "state": "upstash-redis" if REDIS_REST_URL and REDIS_REST_TOKEN else "local-development",
     }
 
 
@@ -609,6 +897,15 @@ async def platforms():
     return {"platforms": [
         {"id": "tiktok", "name": "TikTok", "color": "#000000"},
         {"id": "instagram", "name": "Instagram", "color": "gradient"},
+    ]}
+
+
+@app.get("/api/v1/platforms")
+async def v1_platforms():
+    return {"platforms": [
+        {"id": "tiktok", "name": "TikTok", "media": ["video", "audio", "gallery"]},
+        {"id": "instagram", "name": "Instagram", "media": ["video", "audio", "gallery"]},
+        {"id": "youtube", "name": "YouTube", "media": ["video", "audio"]},
     ]}
 
 
@@ -674,6 +971,81 @@ async def extract_post(request: Request, body: Optional[Dict[str, Any]] = None):
 
 
 # ----------------------------------------------------------------------------
+# v1 public client contract.  Unlike the legacy endpoints, it never returns
+# upstream media URLs, cookies, headers, or a project-wide API secret.
+# ----------------------------------------------------------------------------
+@app.post("/api/v1/client-sessions")
+async def create_client_session(request: Request, body: Optional[Dict[str, Any]] = None):
+    if not rate_ok("session:" + client_ip(request)):
+        raise HTTPException(status_code=429, detail="Too many session requests. Try again shortly.")
+    if body is None:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+    return issue_guest_session(str((body or {}).get("installation_id") or ""), request)
+
+
+@app.post("/api/v1/extractions")
+async def create_v1_extraction(request: Request, body: Optional[Dict[str, Any]] = None):
+    token, session = require_guest_session(request)
+    if not rate_ok("extract:" + hashlib.sha256(token.encode()).hexdigest()[:16]):
+        raise HTTPException(status_code=429, detail="Too many extraction requests. Wait a minute and retry.")
+    if body is None:
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+    payload = body or {}
+    url = clean_url(str(payload.get("url") or ""))
+    platform = detect_v1_platform(url)
+    if not platform:
+        raise HTTPException(status_code=400, detail="Unsupported URL. Use a public TikTok, Instagram, or YouTube link.")
+    audio_only = bool(payload.get("audio_only"))
+    try:
+        loop = asyncio.get_running_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: extract_v1_sync(url, audio_only)),
+            timeout=max(EXTRACT_TIMEOUT, 5),
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Extraction timed out. Retry in a moment.")
+    except (RuntimeError, ValueError, UnsupportedMedia) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)[:350])
+    if result.get("blocked"):
+        raise HTTPException(status_code=422, detail=result.get("blocked_message") or "This media is unavailable.")
+    cache_set(_ckey(_key_url(url), "True|False|None"), result)
+    return public_v1_extraction(make_v1_extraction(url, result, str(session["installation_hash"])))
+
+
+@app.get("/api/v1/extractions/{extraction_id}")
+async def get_v1_extraction(extraction_id: str, request: Request):
+    _token, session = require_guest_session(request)
+    record = state_get(_extraction_key(extraction_id))
+    if not record or record.get("owner") != session.get("installation_hash"):
+        raise HTTPException(status_code=404, detail="Extraction expired or was not found.")
+    return public_v1_extraction(record)
+
+
+@app.get("/api/v1/extractions/{extraction_id}/assets/{asset_id}/download")
+async def download_v1_asset(extraction_id: str, asset_id: str, request: Request):
+    _token, session = require_guest_session(request)
+    record = state_get(_extraction_key(extraction_id))
+    if not record or record.get("owner") != session.get("installation_hash"):
+        raise HTTPException(status_code=404, detail="Download expired. Extract the link again.")
+    asset = (record.get("assets") or {}).get(asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="The selected format is no longer available.")
+    title = _sanitize_name(record.get("result", {}).get("title") or "media")
+    suffix = f"-{asset_id}" if asset.get("kind") == "image" else ""
+    filename = f"{title}{suffix}.{asset.get('ext') or 'mp4'}"
+    return await _stream_download(
+        request, record["source_url"], str(asset["format"]), filename,
+        str(record.get("result", {}).get("platform") or ""), v1=True,
+    )
+
+
+# ----------------------------------------------------------------------------
 # One-step download: resolve formats + stream media FROM THE SAME LAMBDA.
 # Critical because TikTok signs media URLs to the requesting IP — a
 # separate proxy server gets 403. Same-instance fetch keeps the signature valid.
@@ -683,18 +1055,8 @@ def _sanitize_name(name: str) -> str:
     return (" ".join(keep.split()) or "media")[:120]
 
 
-@app.get("/api/download")
-async def download(
-    request: Request,
-    u: str = Query(..., description="Original page URL"),
-    f: str = Query("best", description="yt-dlp format_id, or 'best'"),
-    n: str = Query("", description="Filename"),
-):
-    check_auth(request)  # supports ?key= for browser navigation
-    page_url = clean_url(u)
-    platform = detect_platform(page_url)
-    if not platform:
-        raise HTTPException(status_code=400, detail="Unsupported URL")
+async def _stream_download(request: Request, page_url: str, f: str, n: str, platform: str, v1: bool = False):
+    """Resolve and stream a legacy or v1 asset from the extracting function."""
 
     # Resolve + stream via explicit strategy chain. Each strategy is one
     # (resolve-mode, media-source) combo; first successful open wins.
@@ -703,13 +1065,13 @@ async def download(
     resp = None
 
     async def _resolve(fresh: bool) -> dict:
-        key = _ckey(_key_url(page_url), "False|None")
+        key = _ckey(_key_url(page_url), f"{v1}|False|None")
         result = None if fresh else cache_get(key)
         if not result or result.get("blocked"):
             loop = asyncio.get_running_loop()
             try:
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: extract_sync(page_url)),
+                    loop.run_in_executor(None, lambda: extract_v1_sync(page_url) if v1 else extract_sync(page_url)),
                     timeout=max(EXTRACT_TIMEOUT, 5),
                 )
             except asyncio.TimeoutError:
@@ -733,6 +1095,9 @@ async def download(
                 for fmt in result.get("formats", {}).get(group, []):
                     if str(fmt.get("format_id")) == f:
                         return fmt["url"], dict(fmt.get("headers") or {}), fmt.get("cookies"), True
+            for item in result.get("gallery", []):
+                if str(item.get("format_id")) == f:
+                    return item["url"], dict(item.get("headers") or {}), item.get("cookies"), True
         media = result.get("download_url")
         if media and not headers:
             vids = result.get("formats", {}).get("video") or []
@@ -824,6 +1189,22 @@ async def download(
     return StreamingResponse(_iter(resp), status_code=status,
                              media_type=resp.headers.get("Content-Type", "application/octet-stream"),
                              headers=out_headers)
+
+
+@app.get("/api/download")
+async def download(
+    request: Request,
+    u: str = Query(..., description="Original page URL"),
+    f: str = Query("best", description="yt-dlp format_id, or 'best'"),
+    n: str = Query("", description="Filename"),
+):
+    """Legacy downloader. New clients use authenticated v1 asset paths."""
+    check_auth(request)  # supports ?key= only for legacy browser navigation
+    page_url = clean_url(u)
+    platform = detect_platform(page_url)
+    if not platform:
+        raise HTTPException(status_code=400, detail="Unsupported URL")
+    return await _stream_download(request, page_url, f, n, platform)
 
 
 if __name__ == "__main__":
