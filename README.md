@@ -1,6 +1,6 @@
 # toolz-downloadz-api
 
-Media-extraction API for public TikTok, Instagram, and YouTube media. FastAPI + yt-dlp, built for Vercel serverless.
+Media-extraction API for public TikTok and Instagram media. FastAPI, built for Vercel serverless.
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ffreroxx%2Ftoolz-downloadz-api&env=API_SECRET_KEY,INSTAGRAM_COOKIES)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
