@@ -424,9 +424,13 @@ def ydl_opts(platform: str, audio_only: bool = False,
         cf = _cookies_file(YOUTUBE_COOKIES, "yt_cookies.txt")
         if cf:
             opts["cookiefile"] = cf
-        # Never promise server-side muxing on Vercel.  Native muxed and
-        # separate source rows are surfaced honestly by normalize().
-        opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
+        # Fallback chain, not just "best": many current videos have NO muxed
+        # file (DASH-split only), where bare "best" hard-fails with
+        # "Requested format is not available" before info is even returned.
+        # shape() ignores split merge pairs and ranks the ladder instead, so
+        # the default stays an honest best file, never a silent video track.
+        opts["format"] = custom_format or (
+            "bestaudio/best" if audio_only else "best/bestvideo+bestaudio")
         opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
     return opts
 
@@ -512,13 +516,22 @@ def shape(platform: str, info: dict, original_url: str) -> dict:
     hdrs = dict(info.get("http_headers") or {})
     dl_cookies = None
     if not dl and info.get("requested_formats"):
-        wanted = [f for f in info["requested_formats"]
-                  if f.get("vcodec") != "none" and "m3u8" not in (f.get("protocol") or "")
-                  and ".m3u8" not in (f.get("url") or "")] or info["requested_formats"]
-        pick = wanted[0]
-        dl = pick.get("url")
-        hdrs = dict(pick.get("http_headers") or {})
-        dl_cookies = pick.get("cookies")
+        req = info["requested_formats"]
+        # A split merge pair (video-only + audio-only rows) is not a
+        # downloadable file — ignore it and rank the ladder below, so
+        # DASH-only videos get honest rows (and an honest default) instead
+        # of a silent video track or a "format not available" abort.
+        # Single preselected files (TikTok/IG best) pass through untouched.
+        is_split_pair = len(req) > 1 and any(
+            f.get("vcodec") == "none" or f.get("acodec") == "none" for f in req)
+        if not is_split_pair:
+            wanted = [f for f in req
+                      if f.get("vcodec") != "none" and "m3u8" not in (f.get("protocol") or "")
+                      and ".m3u8" not in (f.get("url") or "")] or req
+            pick = wanted[0]
+            dl = pick.get("url")
+            hdrs = dict(pick.get("http_headers") or {})
+            dl_cookies = pick.get("cookies")
     if not dl:
         merged = [f for f in video if f["vcodec"] not in (None, "none") and f["acodec"] not in (None, "none")]
         # Default is 1080p: exact match wins, else highest available.

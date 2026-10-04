@@ -339,7 +339,8 @@ def test_youtube_opts_use_cookiefile_when_configured(monkeypatch):
     with open(opts["cookiefile"], encoding="utf-8") as f:
         content = f.read()
     assert "VISITOR_INFO1_LIVE" in content and "LOGIN_INFO" in content
-    assert opts["format"] == "best"
+    # Fallback chain so DASH-only videos (no muxed file) don't hard-fail.
+    assert opts["format"] == "best/bestvideo+bestaudio"
     assert opts["extractor_args"]["youtube"]["player_client"] == ["android", "web"]
 
 
@@ -347,7 +348,7 @@ def test_youtube_opts_skip_cookiefile_when_unset(monkeypatch):
     monkeypatch.setattr(api, "YOUTUBE_COOKIES", "")
     opts = api.ydl_opts("youtube")
     assert "cookiefile" not in opts
-    assert opts["format"] == "best"
+    assert opts["format"] == "best/bestvideo+bestaudio"
 
 
 def test_youtube_v1_detection_covers_watch_shorts_music():
@@ -559,3 +560,32 @@ def test_gvs_recheck_only_blocks_on_403(monkeypatch):
         raise OSError("conn reset")
     monkeypatch.setattr(api.urllib.request, "urlopen", _down)
     api._ytapi_recheck_streams(shaped)  # inconclusive: silent, download reports
+
+
+# --- shape(): split-pair ranking (DASH-only YouTube) -------------------------
+def test_shape_ignores_split_pair_prefers_muxed():
+    v1080 = _ydl_fmt("v1080", 1920, 1080, vc="avc1", ac="none", size=9000)
+    a128 = _ydl_fmt("a128", 0, 0, vc="none", ac="mp4a", size=1000)
+    mux720 = _ydl_fmt("mux720", 1280, 720, vc="avc1", ac="mp4a", size=5000)
+    info = {"title": "t", "formats": [mux720, v1080, a128],
+            "requested_formats": [v1080, a128]}
+    out = api.shape("youtube", info, YT_URL)
+    assert out["download_url"] == "https://cdn/mux720.mp4"  # with sound, not silent 1080p
+
+
+def test_shape_dash_only_defaults_to_best_video_row():
+    v1080 = _ydl_fmt("v1080", 1920, 1080, vc="avc1", ac="none", size=9000)
+    v720 = _ydl_fmt("v720", 1280, 720, vc="avc1", ac="none", size=5000)
+    a128 = _ydl_fmt("a128", 0, 0, vc="none", ac="mp4a", size=1000)
+    info = {"title": "t", "formats": [v1080, v720, a128],
+            "requested_formats": [v1080, a128]}
+    out = api.shape("youtube", info, YT_URL)
+    assert out["download_url"] == "https://cdn/v1080.mp4"
+    assert len(out["formats"]["video"]) == 2 and len(out["formats"]["audio"]) == 1
+
+
+def test_shape_single_requested_file_still_direct():
+    mux = _ydl_fmt("mux", 1280, 720, size=4000)
+    info = {"title": "t", "formats": [mux], "requested_formats": [mux]}
+    out = api.shape("tiktok", info, TT)
+    assert out["download_url"] == "https://cdn/mux.mp4"
