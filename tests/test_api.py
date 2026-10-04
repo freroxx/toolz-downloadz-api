@@ -321,3 +321,42 @@ def test_extract_auto_merges_full_ladder(monkeypatch):
     assert [v["format_id"] for v in out["formats"]["video"]] == [
         "bytevc1_1080p_1114895-0", "h264_720p_1324906-0"]
     assert out["download_url"] == "https://cdn/hdplay.mp4"  # default stays 1080p HD
+
+
+# --- YouTube cookie wiring (offline) ----------------------------------------
+YT_COOKIES = (
+    "# Netscape HTTP Cookie File\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tVISITOR_INFO1_LIVE\tabc123\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\tdef456:xyz\n"
+)
+
+
+def test_youtube_opts_use_cookiefile_when_configured(monkeypatch):
+    monkeypatch.setattr(api, "YOUTUBE_COOKIES", YT_COOKIES)
+    opts = api.ydl_opts("youtube")
+    assert "cookiefile" in opts
+    assert opts["cookiefile"].endswith("yt_cookies.txt")
+    with open(opts["cookiefile"], encoding="utf-8") as f:
+        content = f.read()
+    assert "VISITOR_INFO1_LIVE" in content and "LOGIN_INFO" in content
+    assert opts["format"] == "best"
+    assert opts["extractor_args"]["youtube"]["player_client"] == ["android", "web"]
+
+
+def test_youtube_opts_skip_cookiefile_when_unset(monkeypatch):
+    monkeypatch.setattr(api, "YOUTUBE_COOKIES", "")
+    opts = api.ydl_opts("youtube")
+    assert "cookiefile" not in opts
+    assert opts["format"] == "best"
+
+
+def test_youtube_v1_detection_covers_watch_shorts_music():
+    for u in (
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://youtu.be/dQw4w9WgXcQ",
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+    ):
+        assert api.detect_v1_platform(u) == "youtube", u
+    assert api.detect_v1_platform("https://vimeo.com/123456") is None

@@ -33,6 +33,12 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 # ----------------------------------------------------------------------------
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
+# YouTube works like every other working downloader (incl. cobalt's
+# reference setup): yt-dlp + logged-in cookies. The cookies carry the trust
+# that datacenter IPs lack, so extraction succeeds without PO infra.
+# Use a THROWAWAY Google account — never your main one. Rotate when
+# extractions start failing with bot-wall errors.
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -211,7 +217,8 @@ def detect_v1_platform(url: str) -> Optional[str]:
     if legacy:
         return legacy
     host = _source_host(url)
-    if _host_is(host, "youtube.com") or host == "youtu.be":
+    if (_host_is(host, "youtube.com") or _host_is(host, "youtube-nocookie.com")
+            or host == "youtu.be"):
         return "youtube"
     return None
 
@@ -373,6 +380,13 @@ def ydl_opts(platform: str, audio_only: bool = False,
             opts["cookiefile"] = cf
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
     elif platform == "youtube":
+        # Logged-in cookies do the heavy lifting (see YOUTUBE_COOKIES above):
+        # they carry account trust, so YouTube serves player responses even
+        # from flagged datacenter IPs. No PO-token server needed for the
+        # ANDROID-first client rotation.
+        cf = _cookies_file(YOUTUBE_COOKIES, "yt_cookies.txt")
+        if cf:
+            opts["cookiefile"] = cf
         # Never promise server-side muxing on Vercel.  Native muxed and
         # separate source rows are surfaced honestly by normalize().
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
