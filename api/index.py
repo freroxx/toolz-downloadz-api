@@ -747,7 +747,7 @@ def _ytapi_fetch(url: str) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as res:
+        with urllib.request.urlopen(req, timeout=40) as res:
             body = json.loads(res.read().decode("utf-8"))
     except Exception as e:
         raise RuntimeError(f"extraction service unreachable: {str(e)[:120]}")
@@ -1168,9 +1168,13 @@ async def create_v1_extraction(request: Request, body: Optional[Dict[str, Any]] 
     audio_only = bool(payload.get("audio_only"))
     try:
         loop = asyncio.get_running_loop()
+        # YouTube may chain yt-dlp + microservice + token minting on cold
+        # starts; give it room inside the 60s function budget. TikTok/IG
+        # keep the tight default.
+        budget = max(EXTRACT_TIMEOUT, 50) if platform == "youtube" else max(EXTRACT_TIMEOUT, 5)
         result = await asyncio.wait_for(
             loop.run_in_executor(None, lambda: extract_v1_sync(url, audio_only)),
-            timeout=max(EXTRACT_TIMEOUT, 5),
+            timeout=budget,
         )
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Extraction timed out. Retry in a moment.")
