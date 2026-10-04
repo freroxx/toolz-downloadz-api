@@ -360,3 +360,152 @@ def test_youtube_v1_detection_covers_watch_shorts_music():
     ):
         assert api.detect_v1_platform(u) == "youtube", u
     assert api.detect_v1_platform("https://vimeo.com/123456") is None
+
+
+# --- YouTube dead-link vs refusal distinction (offline) ----------------------
+def test_youtube_id_shapes():
+    assert api._youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert api._youtube_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert api._youtube_id("https://www.youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert api._youtube_id("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert api._youtube_id("https://vimeo.com/123456") is None
+    assert api._youtube_id("not a url") is None
+
+
+def test_youtube_dead_link_says_unavailable(monkeypatch):
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: (_ for _ in ()).throw(
+        Exception("[youtube] cx0mMqqF8lQ: Requested format is not available")))
+    monkeypatch.setattr(api, "_oembed", lambda endpoint: None)
+    with pytest.raises(RuntimeError, match="doesn't exist"):
+        api.extract_v1_sync("https://www.youtube.com/watch?v=cx0mMqqF8lQ")
+
+
+def test_youtube_refusal_keeps_original_error_when_video_exists(monkeypatch):
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: (_ for _ in ()).throw(
+        Exception("[youtube] dQw4w9WgXcQ: Requested format is not available")))
+    monkeypatch.setattr(api, "_oembed", lambda endpoint: {"title": "t"})
+    with pytest.raises(RuntimeError, match="YouTube extraction failed"):
+        api.extract_v1_sync("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+
+# --- toolz-ytapi fallback chain (offline) -----------------------------------
+YT_CONTRACT = {
+    "title": "Never Gonna Give You Up",
+    "thumbnail": "https://i.ytimg.com/vi/dQw4w9WgXcQ/hq.jpg",
+    "duration": 213,
+    "uploader": "Rick Astley",
+    "uploader_url": "https://www.youtube.com/@RickAstleyYT",
+    "view_count": 1000,
+    "like_count": 50,
+    "comment_count": 5,
+    "upload_date": "20091024",
+    "description": "The official video",
+    "formats": [
+        {"url": "https://r1/itag=22", "itag": 22,
+         "mime": 'video/mp4; codecs="avc1.64001F, mp4a.40.2"',
+         "width": 1280, "height": 720, "bitrate": 2000000,
+         "quality_label": "720p", "is_audio": False, "has_audio": True},
+        {"url": "https://r1/itag=137", "itag": 137,
+         "mime": 'video/mp4; codecs="avc1.640028"',
+         "width": 1920, "height": 1080, "bitrate": 4500000,
+         "quality_label": "1080p", "is_audio": False, "has_audio": False},
+        {"url": "https://r1/itag=140", "itag": 140,
+         "mime": 'audio/mp4; codecs="mp4a.40.2"',
+         "bitrate": 128000, "quality_label": None,
+         "is_audio": True, "has_audio": False},
+        {"url": None, "itag": 999, "mime": "video/mp4", "is_audio": False},
+    ],
+}
+YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def _no_formats(url):
+    raise Exception("[youtube] dQw4w9WgXcQ: Requested format is not available")
+
+
+def test_ytapi_info_maps_contract_to_ydl_rows():
+    info = api._ytapi_info(YT_CONTRACT, YT_URL)
+    assert [f["format_id"] for f in info["formats"]] == ["yta_22", "yta_137", "yta_140"]
+    v1080 = [f for f in info["formats"] if f["height"] == 1080][0]
+    assert v1080["vcodec"] == "avc1" and v1080["has_audio"] is False
+    v720 = [f for f in info["formats"] if f["height"] == 720][0]
+    assert v720["vcodec"] == "avc1" and v720["has_audio"] is True
+    aud = [f for f in info["formats"] if f["vcodec"] == "none"]
+    assert len(aud) == 1 and aud[0]["acodec"] == "mp4a" and aud[0]["has_audio"] is False
+    assert info["title"] == "Never Gonna Give You Up"
+    assert info["view_count"] == 1000
+
+
+def test_fallback_wins_when_ytdlp_finds_nothing(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: _no_formats(url))
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: YT_CONTRACT)
+    out = api.extract_v1_sync(YT_URL)
+    assert out["platform"] == "youtube"
+    assert out["title"] == "Never Gonna Give You Up"
+    vids = {v["height"] for v in out["formats"]["video"]}
+    assert {720, 1080} <= vids
+    assert len(out["formats"]["audio"]) == 1
+    assert out["download_url"]  # default prefers 1080p
+
+
+def test_ytdlp_success_never_touches_ytapi(monkeypatch):
+    called = []
+    monkeypatch.setattr(api, "run_ydl",
+                         lambda opts, url: {"title": "t", "formats": [], "url": "https://cdn/v.mp4",
+                                            "ext": "mp4", "http_headers": {}})
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: called.append(url) or YT_CONTRACT)
+    out = api.extract_v1_sync(YT_URL)
+    assert called == [] and out["download_url"] == "https://cdn/v.mp4"
+
+
+def test_no_ytapi_url_preserves_dead_link_message(monkeypatch):
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: _no_formats(url))
+    monkeypatch.setattr(api, "_oembed", lambda endpoint: None)
+    with pytest.raises(RuntimeError, match="doesn't exist"):
+        api.extract_v1_sync(YT_URL)
+
+
+def test_ytapi_should_retry_gating(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    assert api._ytapi_should_retry("Sign in to confirm you're not a bot")
+    assert api._ytapi_should_retry("[youtube] x: Requested format is not available")
+    assert api._ytapi_should_retry("cipher protected")
+    assert not api._ytapi_should_retry("This video is private")
+    assert not api._ytapi_should_retry("Video unavailable")
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "")
+    assert not api._ytapi_should_retry("Requested format is not available")
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        import json as _json
+        return _json.dumps(self._payload).encode()
+
+
+def test_ytapi_fetch_contract_and_errors(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api.urllib.request, "urlopen",
+                         lambda req, timeout=20: _FakeResp({"ok": True, "data": YT_CONTRACT}))
+    assert api._ytapi_fetch(YT_URL)["title"] == "Never Gonna Give You Up"
+
+    monkeypatch.setattr(api.urllib.request, "urlopen",
+                         lambda req, timeout=20: _FakeResp(
+                             {"ok": False, "error": "private", "detail": "Private video"}))
+    with pytest.raises(RuntimeError, match="private"):
+        api._ytapi_fetch(YT_URL)
+
+    def _boom(req, timeout=20):
+        raise OSError("conn reset")
+    monkeypatch.setattr(api.urllib.request, "urlopen", _boom)
+    with pytest.raises(RuntimeError, match="unreachable"):
+        api._ytapi_fetch(YT_URL)

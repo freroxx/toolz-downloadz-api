@@ -8,6 +8,7 @@ A flat, dependency-free-import file eliminates the NOT_FOUND class of bugs.
 Run locally:  uvicorn api.index:app --reload   (or: python api/index.py)
 """
 import os
+import re
 import time
 import json
 import asyncio
@@ -35,10 +36,17 @@ API_SECRET_KEY = os.getenv("API_SECRET_KEY", "").strip()
 INSTAGRAM_COOKIES = os.getenv("INSTAGRAM_COOKIES", "").strip()
 # YouTube works like every other working downloader (incl. cobalt's
 # reference setup): yt-dlp + logged-in cookies. The cookies carry the trust
-# that datacenter IPs lack, so extraction succeeds without PO infra.
-# Use a THROWAWAY Google account — never your main one. Rotate when
-# extractions start failing with bot-wall errors.
+# that datacenter IPs lack. Use a THROWAWAY Google account — never your main
+# one. Rotate when extractions start failing with bot-wall errors.
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
+# YouTube extraction microservice (toolz-ytapi: youtubei.js + same cookies).
+# Python yt-dlp on serverless cannot decipher ciphered streams and may lack
+# PO tokens; youtubei.js deciphers natively in JS. Used as fallback when
+# yt-dlp finds zero usable formats. Unset = yt-dlp only (+ dead-link check).
+YT_EXTRACT_URL = (os.getenv("YT_EXTRACT_URL") or "").strip().rstrip("/")
+YTAPI_SECRET = (os.getenv("YTAPI_SECRET") or "").strip()
+
+_YTAPI_RETRY_RE = None  # compiled lazily
 
 
 def _int_env(name: str, default: int) -> int:
@@ -247,6 +255,35 @@ def _oembed(endpoint_url: str) -> Optional[dict]:
 
 def tiktok_oembed(url: str) -> Optional[dict]:
     return _oembed("https://www.tiktok.com/oembed?url=" + urllib.parse.quote(tiktok_canonical(url), safe=""))
+
+
+def _youtube_id(url: str) -> Optional[str]:
+    """11-char video id from watch?v=, youtu.be/, shorts/, embed/, live/."""
+    try:
+        u = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    host = (u.hostname or "").lower()
+    if host == "youtu.be":
+        seg = (u.path or "").strip("/").split("/")[0]
+        return seg if len(seg) == 11 else None
+    m = re.search(r"/(?:shorts|embed|live|v)/([a-zA-Z0-9_-]{11})", u.path or "")
+    if m:
+        return m.group(1)
+    for k, v in urllib.parse.parse_qsl(u.query or ""):
+        if k == "v" and len(v) == 11:
+            return v
+    return None
+
+
+def youtube_oembed(url: str) -> Optional[dict]:
+    """Public metadata probe. None = video doesn't exist / is private."""
+    vid = _youtube_id(url)
+    if not vid:
+        return None
+    return _oembed("https://www.youtube.com/oembed?url=" +
+                   urllib.parse.quote(f"https://www.youtube.com/watch?v={vid}", safe="") +
+                   "&format=json")
 
 
 def _tikwm_fetch(url: str) -> Optional[dict]:
@@ -685,6 +722,95 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         raise RuntimeError(f"{msg[:250]} ({hint})")
 
 
+def _ytapi_should_retry(msg: str) -> bool:
+    """Fallback-worthy failures: wall + cipher/PO gaps. Never private/dead."""
+    global _YTAPI_RETRY_RE
+    if not YT_EXTRACT_URL:
+        return False
+    if _YTAPI_RETRY_RE is None:
+        _YTAPI_RETRY_RE = re.compile(
+            r"sign in|not a bot|login required|requested format|no video formats"
+            r"|po token|potoken|decipher|cipher|player response|empty",
+            re.IGNORECASE,
+        )
+    return bool(_YTAPI_RETRY_RE.search(msg or ""))
+
+
+def _ytapi_fetch(url: str) -> dict:
+    """Call the extraction microservice. Raises RuntimeError on any failure."""
+    payload = json.dumps({"url": url}).encode()
+    req = urllib.request.Request(
+        YT_EXTRACT_URL + "/api/extract",
+        data=payload,
+        headers={"Content-Type": "application/json",
+                  "Authorization": f"Bearer {YTAPI_SECRET}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            body = json.loads(res.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"extraction service unreachable: {str(e)[:120]}")
+    if not body.get("ok"):
+        raise RuntimeError(
+            f"extraction service: {body.get('error', 'failed')}: "
+            f"{str(body.get('detail') or '')[:160]}"
+        )
+    data = body.get("data") or {}
+    if not (data.get("formats") or data.get("title")):
+        raise RuntimeError("extraction service returned no streams")
+    return data
+
+
+def _ytapi_info(contract: dict, url: str) -> dict:
+    """Map the microservice contract to a yt-dlp-shaped info for shape()."""
+    fmts = []
+    for i, f in enumerate(contract.get("formats") or []):
+        if not isinstance(f, dict) or not f.get("url"):
+            continue
+        mime = str(f.get("mime") or "")
+        container = mime.split(";")[0].strip().split("/")[-1].lower() or "mp4"
+        ext = container if container in ("mp4", "webm", "m4a", "mp3", "3gp") else "mp4"
+        audio = bool(f.get("is_audio"))
+        bitrate = f.get("bitrate") or 0
+        codec = None
+        m = re.search(r'codecs="([^"]+)"', mime)
+        if m:
+            codec = m.group(1).split(",")[0].strip().split(".")[0] or None
+        fmts.append({
+            "format_id": f"yta_{f.get('itag') or i}",
+            "ext": ext,
+            "resolution": f.get("quality_label") or ("audio" if audio else "unknown"),
+            "url": f["url"],
+            "filesize": f.get("content_length"),
+            "vcodec": "none" if audio else codec,
+            "acodec": codec if audio else None,
+            "has_audio": False if audio else f.get("has_audio"),
+            "height": f.get("height"), "width": f.get("width"),
+            "tbr": (bitrate / 1000) if bitrate else None,
+            "abr": (bitrate / 1000) if (audio and bitrate) else None,
+            "fps": f.get("fps"),
+            "protocol": "https",
+            "http_headers": {},
+            "cookies": None,
+        })
+    return {
+        "title": contract.get("title"),
+        "thumbnail": contract.get("thumbnail"),
+        "duration": contract.get("duration"),
+        "uploader": contract.get("uploader"),
+        "uploader_url": contract.get("uploader_url"),
+        "view_count": contract.get("view_count"),
+        "like_count": contract.get("like_count"),
+        "comment_count": contract.get("comment_count"),
+        "upload_date": contract.get("upload_date"),
+        "description": contract.get("description"),
+        "ext": None,
+        "formats": fmts,
+        "entries": None,
+    }
+
+
 def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
     """Versioned extraction entry point. Legacy routes remain TikTok/IG-only."""
     platform = detect_v1_platform(url)
@@ -693,7 +819,31 @@ def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
             info = run_ydl(ydl_opts("youtube", audio_only), url)
             return gallery_shape(platform, info, url) or shape(platform, info, url)
         except Exception as exc:
-            raise RuntimeError(f"YouTube extraction failed: {str(exc).replace('ERROR: ', '')[:260]}")
+            msg = str(exc).replace("ERROR: ", "")
+            ytapi_note = ""
+            if _ytapi_should_retry(msg):
+                # yt-dlp found nothing usable (cipher-only streams are the
+                # usual cause on serverless: no JS runtime to decipher).
+                # youtubei.js deciphers natively — try the microservice.
+                try:
+                    contract = _ytapi_fetch(url)
+                    info = _ytapi_info(contract, url)
+                    shaped = gallery_shape(platform, info, url) or shape(platform, info, url)
+                    if (shaped.get("download_url") or shaped.get("formats", {}).get("video")
+                            or shaped.get("formats", {}).get("audio")):
+                        return shaped
+                except Exception as e2:
+                    ytapi_note = f" [fallback: {str(e2)[:120]}]"
+            if "Requested format is not available" in msg or "no video formats" in msg.lower():
+                # yt-dlp found zero usable streams. Distinguish a dead link
+                # (oEmbed 404s too) from a genuine extraction refusal so the
+                # UI can say so instead of quoting yt-dlp internals.
+                if not youtube_oembed(url):
+                    raise RuntimeError(
+                        "This YouTube video doesn't exist, is private, or was "
+                        "removed. Check the link and try a public video."
+                    )
+            raise RuntimeError(f"YouTube extraction failed: {msg[:260]}{ytapi_note}")
     return extract_sync(url, audio_only)
 
 

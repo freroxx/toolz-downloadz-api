@@ -51,6 +51,7 @@ Tikwm reports byte counts and duration but no dimensions or codecs, so TikTok qu
 |---|---|---|---|
 | `API_SECRET_KEY` | yes | — | `openssl rand -hex 32`. Must match the frontend. Unset = no auth (local dev only). |
 | `YOUTUBE_COOKIES` | for YouTube | — | Full Netscape `cookies.txt` from a browser logged into a **throwaway** Google account (never your main). Same pattern as Instagram: export with "Get cookies.txt LOCALLY", paste whole file content, redeploy. Rotate when bot-wall errors return. |
+| `YT_EXTRACT_URL` / `YTAPI_SECRET` | YouTube decipher fallback | — | Deployed `toolz-ytapi` URL + shared secret (must match on both sides). When yt-dlp finds zero usable formats (ciphered streams need JS deciphering), the API retries via youtubei.js. Unset = yt-dlp only. |
 | `INSTAGRAM_COOKIES` | for IG | — | Full Netscape `cookies.txt` from a logged-in instagram.com browser. TikTok needs nothing. |
 | `EXTRACT_TIMEOUT` | no | `26` | Seconds before extraction gives up. |
 | `CACHE_TTL` | no | `3600` | Cache seconds for successful extractions (in-memory, per instance). |
