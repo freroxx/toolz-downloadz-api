@@ -811,6 +811,55 @@ def _ytapi_info(contract: dict, url: str) -> dict:
     }
 
 
+def _ytapi_primary_error(ytapi_msg: str, ytdl_msg: str) -> RuntimeError:
+    """Prefer the microservice's structured verdict over yt-dlp wall text."""
+    m = re.search(r"extraction service:\s*(\w+):\s*(.*)", ytapi_msg)
+    if not m:
+        return RuntimeError(f"YouTube extraction failed: {ytdl_msg[:260]} [{ytapi_msg[:120]}]")
+    code, detail = m.group(1), m.group(2).strip()
+    if code == "private":
+        return RuntimeError("This YouTube video is private.")
+    if code == "age":
+        return RuntimeError(f"This YouTube video is age-restricted ({detail[:120]}).")
+    if code == "region":
+        return RuntimeError(f"This YouTube video is blocked in this region ({detail[:120]}).")
+    if code == "login":
+        return RuntimeError(
+            "YouTube demanded sign-in for this video even with session cookies — "
+            "re-export YOUTUBE_COOKIES from the throwaway account and redeploy. "
+            f"({detail[:120]})"
+        )
+    return RuntimeError(f"YouTube extraction failed: {ytdl_msg[:260]} [{code}: {detail[:120]}]")
+
+
+def _ytapi_recheck_streams(shaped: dict) -> None:
+    """Best-effort GVS check: HEAD the default stream (browser UA + Range).
+
+    Raises only on a definitive HTTP 403 (playback gate without a usable
+    token). Transport errors/timeouts are inconclusive — the download path
+    reports those honestly, so never block on them here.
+    """
+    media = shaped.get("download_url")
+    if not media:
+        return
+    try:
+        req = urllib.request.Request(
+            media,
+            headers={"User-Agent": UA, "Range": "bytes=0-0"},
+            method="HEAD",
+        )
+        with urllib.request.urlopen(req, timeout=8) as res:
+            if res.status == 403:
+                raise RuntimeError(
+                    "Streams were found but Google refuses playback from servers "
+                    "for this video (GVS gate). Try again later or another video."
+                )
+    except RuntimeError:
+        raise
+    except Exception:
+        return  # inconclusive — proceed; download reports real failures
+
+
 def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
     """Versioned extraction entry point. Legacy routes remain TikTok/IG-only."""
     platform = detect_v1_platform(url)
@@ -820,7 +869,6 @@ def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
             return gallery_shape(platform, info, url) or shape(platform, info, url)
         except Exception as exc:
             msg = str(exc).replace("ERROR: ", "")
-            ytapi_note = ""
             if _ytapi_should_retry(msg):
                 # yt-dlp found nothing usable (cipher-only streams are the
                 # usual cause on serverless: no JS runtime to decipher).
@@ -831,9 +879,15 @@ def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
                     shaped = gallery_shape(platform, info, url) or shape(platform, info, url)
                     if (shaped.get("download_url") or shaped.get("formats", {}).get("video")
                             or shaped.get("formats", {}).get("audio")):
+                        _ytapi_recheck_streams(shaped)
                         return shaped
+                except RuntimeError as e2:
+                    # Structured microservice verdicts (private/age/region/
+                    # login) are more precise than yt-dlp's wall text — they
+                    # become the primary error.
+                    raise _ytapi_primary_error(str(e2), msg)
                 except Exception as e2:
-                    ytapi_note = f" [fallback: {str(e2)[:120]}]"
+                    msg += f" [fallback: {str(e2)[:120]}]"
             if "Requested format is not available" in msg or "no video formats" in msg.lower():
                 # yt-dlp found zero usable streams. Distinguish a dead link
                 # (oEmbed 404s too) from a genuine extraction refusal so the
@@ -843,7 +897,7 @@ def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
                         "This YouTube video doesn't exist, is private, or was "
                         "removed. Check the link and try a public video."
                     )
-            raise RuntimeError(f"YouTube extraction failed: {msg[:260]}{ytapi_note}")
+            raise RuntimeError(f"YouTube extraction failed: {msg[:320]}")
     return extract_sync(url, audio_only)
 
 
