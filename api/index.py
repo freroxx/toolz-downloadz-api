@@ -848,14 +848,15 @@ def _ytapi_recheck_streams(shaped: dict) -> None:
             headers={"User-Agent": UA, "Range": "bytes=0-0"},
             method="HEAD",
         )
-        with urllib.request.urlopen(req, timeout=8) as res:
-            if res.status == 403:
-                raise RuntimeError(
-                    "Streams were found but Google refuses playback from servers "
-                    "for this video (GVS gate). Try again later or another video."
-                )
-    except RuntimeError:
-        raise
+        with urllib.request.urlopen(req, timeout=8):
+            return  # reachable: proceed
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            raise RuntimeError(
+                "Streams were found but Google refuses playback from servers "
+                "for this video (GVS gate). Try again later or another video."
+            )
+        return  # other HTTP answers are inconclusive here
     except Exception:
         return  # inconclusive — proceed; download reports real failures
 
@@ -884,7 +885,10 @@ def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
                 except RuntimeError as e2:
                     # Structured microservice verdicts (private/age/region/
                     # login) are more precise than yt-dlp's wall text — they
-                    # become the primary error.
+                    # become the primary error. The GVS verdict already speaks
+                    # for itself and propagates untouched.
+                    if "GVS gate" in str(e2):
+                        raise
                     raise _ytapi_primary_error(str(e2), msg)
                 except Exception as e2:
                     msg += f" [fallback: {str(e2)[:120]}]"

@@ -509,3 +509,53 @@ def test_ytapi_fetch_contract_and_errors(monkeypatch):
     monkeypatch.setattr(api.urllib.request, "urlopen", _boom)
     with pytest.raises(RuntimeError, match="unreachable"):
         api._ytapi_fetch(YT_URL)
+
+
+# --- ytapi structured errors + GVS recheck (offline) -------------------------
+def test_ytapi_primary_error_mapping():
+    assert str(api._ytapi_primary_error(
+        "extraction service: private: Private video", "wall")) == \
+        "This YouTube video is private."
+    assert "age-restricted" in str(api._ytapi_primary_error(
+        "extraction service: age: Sign-in required", "wall"))
+    assert "region" in str(api._ytapi_primary_error(
+        "extraction service: region: Blocked", "wall"))
+    assert "re-export YOUTUBE_COOKIES" in str(api._ytapi_primary_error(
+        "extraction service: login: bot wall", "wall"))
+    generic = str(api._ytapi_primary_error("extraction service unreachable: boom", "wall msg"))
+    assert "wall msg" in generic and "boom" in generic
+
+
+def test_structured_login_becomes_primary_error(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: _no_formats(url))
+    monkeypatch.setattr(api, "_ytapi_fetch",
+                         lambda url: (_ for _ in ()).throw(
+                             RuntimeError("extraction service: login: bot wall")))
+    with pytest.raises(RuntimeError, match="re-export YOUTUBE_COOKIES"):
+        api.extract_v1_sync(YT_URL)
+
+
+class _HeadResp(_FakeResp):
+    def __init__(self, payload, status=200):
+        super().__init__(payload)
+        self.status = status
+
+
+def test_gvs_recheck_only_blocks_on_403(monkeypatch):
+    shaped = {"download_url": "https://r1/videoplayback?x=1", "formats": {"video": [1], "audio": []}}
+    monkeypatch.setattr(api.urllib.request, "urlopen",
+                         lambda req, timeout=8: _HeadResp({}, status=200))
+    api._ytapi_recheck_streams(shaped)  # silent
+    api._ytapi_recheck_streams({"download_url": None})  # nothing to check: silent
+
+    def _denied(req, timeout=8):
+        raise api.urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+    monkeypatch.setattr(api.urllib.request, "urlopen", _denied)
+    with pytest.raises(RuntimeError, match="GVS gate"):
+        api._ytapi_recheck_streams(shaped)
+
+    def _down(req, timeout=8):
+        raise OSError("conn reset")
+    monkeypatch.setattr(api.urllib.request, "urlopen", _down)
+    api._ytapi_recheck_streams(shaped)  # inconclusive: silent, download reports
