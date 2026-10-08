@@ -859,3 +859,15 @@ def test_mux_download_reports_a_vanished_quality_cleanly(monkeypatch, with_ffmpe
     api._cache.clear()  # force a fresh resolve so the vanished quality is observed
     r = c.get(asset["download_path"], headers=auth)
     assert r.status_code == 404 and "no longer listed" in r.json()["detail"]
+
+
+def test_the_whole_candidate_chain_reaches_the_client(monkeypatch):
+    chain = "; ".join(f"CAND{i}: LOGIN_REQUIRED (bot wall)" for i in range(8)) + "; MWEB+pot(visitor): no pot (BG client failed: boom)"
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: (_ for _ in ()).throw(
+        RuntimeError(f"extraction service: failed: No client returned playable streams [{chain}]")))
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: _no_formats(url))
+    token = c.post("/api/v1/client-sessions", json={"installation_id": "device-identifier-1234"}).json()["access_token"]
+    r = c.post("/api/v1/extractions", json={"url": YT_URL}, headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 422
+    assert "BG client failed: boom" in r.json()["detail"]  # the mint stage must not be cut off

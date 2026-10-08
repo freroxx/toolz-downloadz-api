@@ -781,7 +781,7 @@ def _ytapi_fetch(url: str) -> dict:
     if not body.get("ok"):
         raise RuntimeError(
             f"extraction service: {body.get('error', 'failed')}: "
-            f"{str(body.get('detail') or '')[:300]}"
+            f"{str(body.get('detail') or '')[:900]}"
         )
     data = body.get("data") or {}
     if not data.get("formats"):
@@ -900,7 +900,7 @@ def _ytapi_primary_error(ytapi_msg: str, ytdl_msg: str) -> RuntimeError:
             f"({detail[:120]})"
         )
     tail = f" | yt-dlp: {ytdl_msg[:160]}" if ytdl_msg else ""
-    return RuntimeError(f"YouTube extraction failed: [{code}] {detail[:300]}{tail}")
+    return RuntimeError(f"YouTube extraction failed: [{code}] {detail[:900]}{tail}")
 
 
 def _ytapi_download_url(video_id: str, format_id: str, filename: str,
@@ -1381,7 +1381,7 @@ async def create_v1_extraction(request: Request, body: Optional[Dict[str, Any]] 
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="Extraction timed out. Retry in a moment.")
     except (RuntimeError, ValueError, UnsupportedMedia) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)[:350])
+        raise HTTPException(status_code=422, detail=str(exc)[:1100])
     if result.get("blocked"):
         raise HTTPException(status_code=422, detail=result.get("blocked_message") or "This media is unavailable.")
     cache_set(_ckey(_key_url(url), "True|False|None"), result)
