@@ -4,6 +4,9 @@ os.environ.setdefault("API_SECRET_KEY", "test123")
 
 from types import SimpleNamespace
 
+import json
+import time
+import re
 import pytest
 from fastapi.testclient import TestClient
 from api import index as api
@@ -341,7 +344,8 @@ def test_youtube_opts_use_cookiefile_when_configured(monkeypatch):
     assert "VISITOR_INFO1_LIVE" in content and "LOGIN_INFO" in content
     # Fallback chain so DASH-only videos (no muxed file) don't hard-fail.
     assert opts["format"] == "best/bestvideo+bestaudio"
-    assert opts["extractor_args"]["youtube"]["player_client"] == ["android", "web"]
+    # android needs a PO token and web is SABR-only: neither can yield a stream here.
+    assert opts["extractor_args"]["youtube"]["player_client"] == ["android_vr", "tv", "mweb"]
 
 
 def test_youtube_opts_skip_cookiefile_when_unset(monkeypatch):
@@ -402,19 +406,25 @@ YT_CONTRACT = {
     "upload_date": "20091024",
     "description": "The official video",
     "formats": [
-        {"url": "https://r1/itag=22", "itag": 22,
-         "mime": 'video/mp4; codecs="avc1.64001F, mp4a.40.2"',
-         "width": 1280, "height": 720, "bitrate": 2000000,
-         "quality_label": "720p", "is_audio": False, "has_audio": True},
-        {"url": "https://r1/itag=137", "itag": 137,
-         "mime": 'video/mp4; codecs="avc1.640028"',
-         "width": 1920, "height": 1080, "bitrate": 4500000,
-         "quality_label": "1080p", "is_audio": False, "has_audio": False},
-        {"url": "https://r1/itag=140", "itag": 140,
-         "mime": 'audio/mp4; codecs="mp4a.40.2"',
-         "bitrate": 128000, "quality_label": None,
-         "is_audio": True, "has_audio": False},
-        {"url": None, "itag": 999, "mime": "video/mp4", "is_audio": False},
+        {"format_id": "18", "itag": 18, "kind": "progressive", "ext": "mp4",
+         "mime": 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', "width": 640, "height": 360,
+         "bitrate": 500000, "content_length": 5000000, "quality_label": "360p",
+         "is_audio": False, "has_audio": True, "fps": 30},
+        {"format_id": "137", "itag": 137, "kind": "video", "ext": "mp4",
+         "mime": 'video/mp4; codecs="avc1.640028"', "width": 1920, "height": 1080,
+         "bitrate": 4500000, "content_length": 90000000, "quality_label": "1080p",
+         "is_audio": False, "has_audio": False, "fps": 30},
+        {"format_id": "313", "itag": 313, "kind": "video", "ext": "webm",
+         "mime": 'video/webm; codecs="vp9"', "width": 3840, "height": 2160,
+         "bitrate": 12000000, "content_length": 300000000, "quality_label": "2160p",
+         "is_audio": False, "has_audio": False, "fps": 30},
+        {"format_id": "140", "itag": 140, "kind": "audio", "ext": "mp4",
+         "mime": 'audio/mp4; codecs="mp4a.40.2"', "bitrate": 128000,
+         "content_length": 3400000, "is_audio": True, "has_audio": False},
+        {"format_id": "137+140", "itag": "137+140", "kind": "merged", "ext": "mp4",
+         "mime": "video/mp4", "width": 1920, "height": 1080, "bitrate": 4628000,
+         "content_length": 93400000, "quality_label": "1080p", "merged": True,
+         "is_audio": False, "has_audio": True, "fps": 30},
     ],
 }
 YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -424,58 +434,179 @@ def _no_formats(url):
     raise Exception("[youtube] dQw4w9WgXcQ: Requested format is not available")
 
 
-def test_ytapi_info_maps_contract_to_ydl_rows():
-    info = api._ytapi_info(YT_CONTRACT, YT_URL)
-    assert [f["format_id"] for f in info["formats"]] == ["yta_22", "yta_137", "yta_140"]
-    v1080 = [f for f in info["formats"] if f["height"] == 1080][0]
-    assert v1080["vcodec"] == "avc1" and v1080["has_audio"] is False
-    v720 = [f for f in info["formats"] if f["height"] == 720][0]
-    assert v720["vcodec"] == "avc1" and v720["has_audio"] is True
-    aud = [f for f in info["formats"] if f["vcodec"] == "none"]
-    assert len(aud) == 1 and aud[0]["acodec"] == "mp4a" and aud[0]["has_audio"] is False
-    assert info["title"] == "Never Gonna Give You Up"
-    assert info["view_count"] == 1000
+def test_youtube_shape_prefers_sound_and_hides_redundant_silent_rows():
+    out = api.youtube_shape(YT_CONTRACT, YT_URL)
+    assert out["platform"] == "youtube" and out["source"] == "ytapi" and out["video_id"] == "dQw4w9WgXcQ"
+    rows = out["formats"]["video"]
+    by_h = {r["height"]: r for r in rows}
+    assert list(by_h) == [2160, 1080, 360]
+    assert by_h[1080]["format_id"] == "137+140" and by_h[1080]["has_audio"] is True
+    assert by_h[2160]["has_audio"] is False  # only offered silent: said so, not hidden
+    assert by_h[360]["has_audio"] is True
+    assert out["best_format"] == "137+140"  # 1080p with sound, never the silent 2160 track
+    assert out["download_url"] is None
+    assert all(r["url"].startswith("ytapi://") for r in rows)  # IP-bound URLs never held here
+    assert out["formats"]["audio"][0]["ext"] == "m4a" and out["formats"]["audio"][0]["acodec"] == "mp4a"
+    assert out["stats"]["view_count"] == 1000
 
 
-def test_fallback_wins_when_ytdlp_finds_nothing(monkeypatch):
+def test_youtube_shape_without_mux_never_defaults_to_a_silent_track_when_sound_exists():
+    contract = dict(YT_CONTRACT, formats=[r for r in YT_CONTRACT["formats"] if not r.get("merged")])
+    out = api.youtube_shape(contract, YT_URL)
+    assert out["best_format"] == "18"  # 360p WITH sound beats silent 1080p
+    only_silent = dict(YT_CONTRACT, formats=[r for r in YT_CONTRACT["formats"] if r["kind"] in ("video", "audio")])
+    assert api.youtube_shape(only_silent, YT_URL)["best_format"] == "137"  # honest: nothing better exists
+
+
+def test_youtube_shape_audio_only_and_empty():
+    out = api.youtube_shape(YT_CONTRACT, YT_URL, audio_only=True)
+    assert out["best_format"] == "140" and out["best_group"] == "audio" and out["ext"] == "m4a"
+    with pytest.raises(RuntimeError, match="no streams"):
+        api.youtube_shape({"formats": [{"nope": 1}]}, YT_URL)
+
+
+def test_ytapi_is_primary_and_ytdlp_is_not_run_on_success(monkeypatch):
     monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
-    monkeypatch.setattr(api, "run_ydl", lambda opts, url: _no_formats(url))
     monkeypatch.setattr(api, "_ytapi_fetch", lambda url: YT_CONTRACT)
+    monkeypatch.setattr(api, "run_ydl", lambda *a: pytest.fail("yt-dlp must not burn the time budget first"))
     out = api.extract_v1_sync(YT_URL)
-    assert out["platform"] == "youtube"
-    assert out["title"] == "Never Gonna Give You Up"
-    vids = {v["height"] for v in out["formats"]["video"]}
-    assert {720, 1080} <= vids
-    assert len(out["formats"]["audio"]) == 1
-    assert out["download_url"]  # default prefers 1080p
+    assert out["source"] == "ytapi" and out["best_format"] == "137+140"
 
 
-def test_ytdlp_success_never_touches_ytapi(monkeypatch):
-    called = []
-    monkeypatch.setattr(api, "run_ydl",
-                         lambda opts, url: {"title": "t", "formats": [], "url": "https://cdn/v.mp4",
-                                            "ext": "mp4", "http_headers": {}})
-    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: called.append(url) or YT_CONTRACT)
+def test_ytdlp_is_the_fallback_when_ytapi_fails(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: (_ for _ in ()).throw(
+        RuntimeError("extraction service: failed: No client returned playable streams")))
+    monkeypatch.setattr(api, "run_ydl", lambda opts, url: {
+        "title": "t", "formats": [], "url": "https://cdn/v.mp4", "ext": "mp4", "http_headers": {}})
     out = api.extract_v1_sync(YT_URL)
-    assert called == [] and out["download_url"] == "https://cdn/v.mp4"
+    assert out["download_url"] == "https://cdn/v.mp4" and out.get("source") != "ytapi"
 
 
-def test_no_ytapi_url_preserves_dead_link_message(monkeypatch):
+def test_both_failing_reports_the_service_verdict_and_ytdlp_text(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: (_ for _ in ()).throw(
+        RuntimeError("extraction service: failed: ANDROID_VR: googlevideo 403")))
     monkeypatch.setattr(api, "run_ydl", lambda opts, url: _no_formats(url))
-    monkeypatch.setattr(api, "_oembed", lambda endpoint: None)
-    with pytest.raises(RuntimeError, match="doesn't exist"):
+    with pytest.raises(RuntimeError) as e:
+        api.extract_v1_sync(YT_URL)
+    assert "googlevideo 403" in str(e.value) and "Requested format" in str(e.value)
+
+
+@pytest.mark.parametrize("code,expect", [
+    ("private", "private"), ("age", "age-restricted"), ("region", "region"),
+    ("unavailable", "doesn't exist"),
+])
+def test_definitive_verdicts_skip_ytdlp(monkeypatch, code, expect):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: (_ for _ in ()).throw(
+        RuntimeError(f"extraction service: {code}: detail")))
+    monkeypatch.setattr(api, "run_ydl", lambda *a: pytest.fail("a verdict can't be changed by yt-dlp"))
+    with pytest.raises(RuntimeError, match=expect):
         api.extract_v1_sync(YT_URL)
 
 
-def test_ytapi_should_retry_gating(monkeypatch):
+def test_ytdlp_fallback_is_skipped_once_the_time_budget_is_spent(monkeypatch):
+    clock = iter([0.0, 40.0, 40.0, 40.0])
+    monkeypatch.setattr(api.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
-    assert api._ytapi_should_retry("Sign in to confirm you're not a bot")
-    assert api._ytapi_should_retry("[youtube] x: Requested format is not available")
-    assert api._ytapi_should_retry("cipher protected")
-    assert not api._ytapi_should_retry("This video is private")
-    assert not api._ytapi_should_retry("Video unavailable")
+    monkeypatch.setattr(api, "_ytapi_fetch", lambda url: (_ for _ in ()).throw(
+        RuntimeError("extraction service unreachable: timed out")))
+    monkeypatch.setattr(api, "run_ydl", lambda *a: pytest.fail("no time left for a second attempt"))
+    with pytest.raises(RuntimeError, match="time budget"):
+        api.extract_v1_sync(YT_URL)
+
+
+def test_no_ytapi_url_means_ytdlp_only_with_android_vr(monkeypatch):
     monkeypatch.setattr(api, "YT_EXTRACT_URL", "")
-    assert not api._ytapi_should_retry("Requested format is not available")
+    seen = {}
+    def fake(opts, url):
+        seen.update(opts)
+        return {"title": "t", "formats": [], "url": "https://cdn/v.mp4", "ext": "mp4", "http_headers": {}}
+    monkeypatch.setattr(api, "run_ydl", fake)
+    api.extract_v1_sync(YT_URL)
+    assert seen["extractor_args"]["youtube"]["player_client"][0] == "android_vr"
+
+
+# --- signed download tickets + redirect (IP-bound googlevideo URLs) ----------
+def _verify_ticket_like_node(secret, ticket, now=None):
+    """Independent re-implementation of toolz-ytapi/lib/ticket.js verifyTicket."""
+    import base64, hashlib, hmac, json as _json
+    body, _, sig = ticket.partition(".")
+    want = base64.urlsafe_b64encode(hmac.new(secret.encode(), body.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+    assert hmac.compare_digest(sig, want)
+    payload = _json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    assert payload["e"] > (now or time.time())
+    assert re.fullmatch(r"[A-Za-z0-9_-]{11}", payload["v"]) and re.fullmatch(r"\d+(\+\d+)?", payload["f"])
+    return payload
+
+
+def test_ticket_is_signed_short_lived_and_unpadded(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "YTAPI_SECRET", "s3cret")
+    url = api._ytapi_download_url("dQw4w9WgXcQ", "137+140", "Rick Roll.mp4", 1080)
+    assert url.startswith("https://ytapi.example/api/extract?t=")
+    ticket = url.split("t=", 1)[1]
+    assert "=" not in ticket and "+" not in ticket and "/" not in ticket
+    payload = _verify_ticket_like_node("s3cret", ticket)
+    assert payload["v"] == "dQw4w9WgXcQ" and payload["f"] == "137+140" and payload["h"] == 1080
+    assert payload["n"] == "Rick Roll.mp4"
+    assert 0 < payload["e"] - time.time() <= api.YT_TICKET_TTL + 2
+    with pytest.raises(AssertionError):
+        _verify_ticket_like_node("wrong", ticket)
+
+
+def test_ticket_requires_service_configuration(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "YTAPI_SECRET", "")
+    with pytest.raises(api.HTTPException) as e:
+        api._ytapi_download_url("dQw4w9WgXcQ", "18", "x.mp4")
+    assert e.value.status_code == 503
+
+
+def test_ytapi_assets_download_via_307_to_the_service_and_never_touch_the_api_network(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    monkeypatch.setattr(api, "YTAPI_SECRET", "s3cret")
+    token = c.post("/api/v1/client-sessions", json={"installation_id": "device-identifier-1234"}).json()["access_token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(api, "extract_v1_sync", lambda url, audio_only=False: api.youtube_shape(YT_CONTRACT, url, audio_only))
+    monkeypatch.setattr(api, "_stream_download", lambda *a, **k: pytest.fail("YouTube bytes must not flow through this API"))
+    payload = c.post("/api/v1/extractions", json={"url": YT_URL}, headers=auth).json()
+    assets = {a["id"]: a for a in payload["assets"]}
+    assert all("url" not in a and "ytapi://" not in json.dumps(a) for a in payload["assets"])
+    best = assets["best"]
+    assert best["has_audio"] is True and best["height"] == 1080 and best["mime_type"] == "video/mp4"
+    r = c.get(best["download_path"], headers=auth, follow_redirects=False)
+    assert r.status_code == 307 and r.headers["cache-control"] == "no-store"
+    ticket = r.headers["location"].split("t=", 1)[1]
+    p = _verify_ticket_like_node("s3cret", ticket)
+    assert p["f"] == "137+140" and p["h"] == 1080 and p["n"].endswith(".mp4")
+    audio = next(a for a in payload["assets"] if a["kind"] == "audio")
+    r2 = c.get(audio["download_path"], headers=auth, follow_redirects=False)
+    assert _verify_ticket_like_node("s3cret", r2.headers["location"].split("t=", 1)[1])["f"] == "140"
+
+
+def test_ytapi_fetch_requests_contract_v2(monkeypatch):
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    sent = {}
+    def fake(req, timeout=0):
+        sent["body"] = json.loads(req.data)
+        sent["timeout"] = timeout
+        return _FakeResp({"ok": True, "data": YT_CONTRACT})
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake)
+    api._ytapi_fetch(YT_URL)
+    assert sent["body"] == {"url": YT_URL, "v": 2} and sent["timeout"] <= 35
+
+
+def test_ytapi_http_error_body_keeps_the_structured_verdict(monkeypatch):
+    import io
+    monkeypatch.setattr(api, "YT_EXTRACT_URL", "https://ytapi.example")
+    def fake(req, timeout=0):
+        raise api.urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {},
+                                         io.BytesIO(b'{"ok":false,"error":"private","detail":"Private video"}'))
+    monkeypatch.setattr(api.urllib.request, "urlopen", fake)
+    with pytest.raises(RuntimeError, match="extraction service: private"):
+        api._ytapi_fetch(YT_URL)
 
 
 class _FakeResp:
@@ -543,25 +674,6 @@ class _HeadResp(_FakeResp):
         self.status = status
 
 
-def test_gvs_recheck_only_blocks_on_403(monkeypatch):
-    shaped = {"download_url": "https://r1/videoplayback?x=1", "formats": {"video": [1], "audio": []}}
-    monkeypatch.setattr(api.urllib.request, "urlopen",
-                         lambda req, timeout=8: _HeadResp({}, status=200))
-    api._ytapi_recheck_streams(shaped)  # silent
-    api._ytapi_recheck_streams({"download_url": None})  # nothing to check: silent
-
-    def _denied(req, timeout=8):
-        raise api.urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, None)
-    monkeypatch.setattr(api.urllib.request, "urlopen", _denied)
-    with pytest.raises(RuntimeError, match="GVS gate"):
-        api._ytapi_recheck_streams(shaped)
-
-    def _down(req, timeout=8):
-        raise OSError("conn reset")
-    monkeypatch.setattr(api.urllib.request, "urlopen", _down)
-    api._ytapi_recheck_streams(shaped)  # inconclusive: silent, download reports
-
-
 # --- shape(): split-pair ranking (DASH-only YouTube) -------------------------
 def test_shape_ignores_split_pair_prefers_muxed():
     v1080 = _ydl_fmt("v1080", 1920, 1080, vc="avc1", ac="none", size=9000)
@@ -589,3 +701,161 @@ def test_shape_single_requested_file_still_direct():
     info = {"title": "t", "formats": [mux], "requested_formats": [mux]}
     out = api.shape("tiktok", info, TT)
     assert out["download_url"] == "https://cdn/mux.mp4"
+
+
+# --- TikTok additions (offline) ----------------------------------------------
+def test_tikwm_offers_a_smaller_sd_file_beside_hd_without_changing_the_default():
+    out = api._tikwm_shape(_tikwm_payload(), TT)
+    assert [v["format_id"] for v in out["formats"]["video"]] == ["tikwm_hd", "tikwm_sd"]
+    sd = out["formats"]["video"][1]
+    assert sd["url"] == "https://cdn/play.mp4" and sd["filesize"] == 5421185 and sd["has_audio"] is True
+    assert out["download_url"] == "https://cdn/hdplay.mp4"  # default unchanged for every client
+    same = api._tikwm_shape(_tikwm_payload(play="https://cdn/hdplay.mp4"), TT)
+    assert [v["format_id"] for v in same["formats"]["video"]] == ["tikwm_hd"]  # no duplicate rung
+
+
+def test_slideshow_exposes_its_soundtrack_as_audio():
+    out = api.tiktok_gallery_shape({"images": ["https://cdn/1.jpg"], "music": "https://cdn/m.mp3", "title": "t"}, TT)
+    assert out["formats"]["audio"][0]["format_id"] == "tikwm_music"
+    assert api.tiktok_gallery_shape({"images": ["https://cdn/1.jpg"]}, TT)["formats"]["audio"] == []
+
+
+# --- merging split tracks (Instagram DASH, YouTube fallback) -----------------
+def _split_result(base="https://cdn"):
+    return {
+        "platform": "instagram", "title": "reel", "ext": "mp4", "download_url": f"{base}/p720.mp4",
+        "download_headers": {}, "download_cookies": None,
+        "formats": {
+            "video": [
+                {"format_id": "dash-v1080", "ext": "mp4", "resolution": "1080x1920", "url": f"{base}/v.mp4",
+                 "filesize": 4000, "vcodec": "avc1", "acodec": "none", "has_audio": None,
+                 "height": 1080, "width": 608, "tbr": 3000, "fps": 30, "headers": {}, "cookies": None},
+                {"format_id": "prog-720", "ext": "mp4", "resolution": "720x1280", "url": f"{base}/p720.mp4",
+                 "filesize": 2000, "vcodec": "avc1", "acodec": "mp4a", "has_audio": None,
+                 "height": 720, "width": 405, "tbr": 1500, "fps": 30, "headers": {}, "cookies": None},
+                {"format_id": "dash-v540", "ext": "mp4", "resolution": "540x960", "url": f"{base}/v540.mp4",
+                 "filesize": 1000, "vcodec": "avc1", "acodec": "none", "has_audio": None,
+                 "height": 540, "width": 304, "tbr": 900, "fps": 30, "headers": {}, "cookies": None},
+            ],
+            "audio": [
+                {"format_id": "dash-a", "ext": "m4a", "resolution": "audio", "url": f"{base}/a.m4a",
+                 "filesize": 500, "vcodec": "none", "acodec": "mp4a", "abr": 128, "headers": {}, "cookies": None},
+            ],
+        },
+    }
+
+
+FFMPEG_FOR_TESTS = os.getenv("FFMPEG_PATH") or api.shutil.which("ffmpeg")
+
+
+@pytest.fixture
+def with_ffmpeg(monkeypatch):
+    if not FFMPEG_FOR_TESTS:
+        pytest.skip("no ffmpeg available")
+    monkeypatch.setenv("FFMPEG_PATH", FFMPEG_FOR_TESTS)
+    monkeypatch.setattr(api, "_FFMPEG", "")
+    yield
+    monkeypatch.setattr(api, "_FFMPEG", "")
+
+
+def test_mux_pairs_only_exist_with_ffmpeg_and_only_for_silent_top_tiers(monkeypatch, with_ffmpeg):
+    pairs = api._mux_pairs(_split_result())
+    # 1080 and 540 are silent-only tracks; 720 already has sound, so no pair for it.
+    assert [(p["height"], p["format_id"]) for p in pairs] == [
+        (1080, "mux:dash-v1080+dash-a"), (540, "mux:dash-v540+dash-a")]
+    assert pairs[0]["has_audio"] is True and pairs[0]["filesize"] == 4500 and pairs[0]["ext"] == "mp4"
+    monkeypatch.setenv("FFMPEG_PATH", "/nonexistent/ffmpeg")
+    monkeypatch.setattr(api, "_FFMPEG", "")
+    assert api._mux_pairs(_split_result()) == []
+
+
+def test_mux_pairs_never_cross_container_families_or_touch_ytapi_and_galleries(with_ffmpeg):
+    r = _split_result()
+    r["formats"]["video"][0]["ext"] = "webm"  # webm video has no webm audio here
+    assert [p["height"] for p in api._mux_pairs(r)] == [540]
+    assert api._mux_pairs({**_split_result(), "source": "ytapi"}) == []
+    assert api._mux_pairs({**_split_result(), "gallery": [{"url": "x"}]}) == []
+
+
+def test_v1_lists_merged_assets_but_legacy_output_is_untouched(with_ffmpeg):
+    result = _split_result()
+    before = json.dumps(result, sort_keys=True)
+    record = api.make_v1_extraction("https://www.instagram.com/reel/abc/", result, "owner")
+    merged = [a for a in record["assets"].values() if str(a["format"]).startswith("mux:")]
+    assert len(merged) == 2 and all(a["has_audio"] is True and a["kind"] == "video" for a in merged)
+    assert json.dumps(result, sort_keys=True) == before  # legacy /api/extract consumers see no change
+    assert all("_video" not in a and "url" not in a for a in record["assets"].values())
+
+
+def test_without_ffmpeg_v1_assets_are_exactly_what_they_were(monkeypatch):
+    monkeypatch.setenv("FFMPEG_PATH", "/nonexistent/ffmpeg")
+    monkeypatch.setattr(api, "_FFMPEG", "")
+    record = api.make_v1_extraction("https://www.instagram.com/reel/abc/", _split_result(), "owner")
+    assert not [a for a in record["assets"].values() if str(a["format"]).startswith("mux:")]
+    assert record["assets"]["best"]["format"] == "best"
+
+
+def test_real_mux_download_streams_one_file_with_both_tracks(monkeypatch, with_ffmpeg, tmp_path):
+    import http.server, subprocess, threading
+
+    def mk(args, name):
+        subprocess.run([FFMPEG_FOR_TESTS, "-hide_banner", "-loglevel", "error", "-y", *args, str(tmp_path / name)], check=True)
+    mk(["-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=25", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof"], "v.mp4")
+    mk(["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac"], "a.m4a")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            data = (tmp_path / self.path.lstrip("/")).read_bytes()
+            m = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+            if m:
+                start = int(m.group(1)); end = int(m.group(2) or len(data) - 1)
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                data = data[start:end + 1]
+            else:
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        res = _split_result(base)
+        res["formats"]["video"] = [r for r in res["formats"]["video"] if r["format_id"] == "dash-v1080"]
+        res["formats"]["video"][0]["url"] = f"{base}/v.mp4"
+        res["formats"]["audio"][0]["url"] = f"{base}/a.m4a"
+        monkeypatch.setattr(api, "extract_v1_sync", lambda url, audio_only=False: res)
+        token = c.post("/api/v1/client-sessions", json={"installation_id": "device-identifier-1234"}).json()["access_token"]
+        auth = {"Authorization": f"Bearer {token}"}
+        payload = c.post("/api/v1/extractions", json={"url": "https://www.instagram.com/reel/abc123/"}, headers=auth).json()
+        asset = next(a for a in payload["assets"] if a["id"].startswith("m_"))
+        r = c.get(asset["download_path"], headers=auth)
+        assert r.status_code == 200 and r.headers["content-type"] == "video/mp4"
+        out = tmp_path / "out.mp4"
+        out.write_bytes(r.content)
+        probe = subprocess.run([FFMPEG_FOR_TESTS, "-hide_banner", "-i", str(out), "-f", "null", "-"],
+                               capture_output=True, text=True).stderr
+        assert re.search(r"Stream #0:\d.*Video:", probe) and re.search(r"Stream #0:\d.*Audio:", probe)
+        assert re.search(r"time=00:00:0[12]", probe)
+    finally:
+        srv.shutdown()
+
+
+def test_mux_download_reports_a_vanished_quality_cleanly(monkeypatch, with_ffmpeg):
+    monkeypatch.setattr(api, "extract_v1_sync", lambda url, audio_only=False: _split_result())
+    token = c.post("/api/v1/client-sessions", json={"installation_id": "device-identifier-1234"}).json()["access_token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    payload = c.post("/api/v1/extractions", json={"url": "https://www.instagram.com/reel/abc123/"}, headers=auth).json()
+    asset = next(a for a in payload["assets"] if a["id"].startswith("m_"))
+    gone = _split_result()
+    gone["formats"]["video"] = []
+    monkeypatch.setattr(api, "extract_v1_sync", lambda url, audio_only=False: gone)
+    api._cache.clear()  # force a fresh resolve so the vanished quality is observed
+    r = c.get(asset["download_path"], headers=auth)
+    assert r.status_code == 404 and "no longer listed" in r.json()["detail"]

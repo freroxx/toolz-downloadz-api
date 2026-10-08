@@ -11,10 +11,14 @@ import os
 import re
 import time
 import json
+import base64
+import hmac
+import shutil
 import asyncio
 import hashlib
 import ipaddress
 import secrets
+import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -23,7 +27,7 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,7 +50,6 @@ YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES", "").strip()
 YT_EXTRACT_URL = (os.getenv("YT_EXTRACT_URL") or "").strip().rstrip("/")
 YTAPI_SECRET = (os.getenv("YTAPI_SECRET") or "").strip()
 
-_YTAPI_RETRY_RE = None  # compiled lazily
 
 
 def _int_env(name: str, default: int) -> int:
@@ -333,6 +336,13 @@ def _tikwm_shape(d: dict, url: str, audio_only: bool = False) -> Optional[dict]:
               "has_audio": True, "ladder": "fast", "ip_free": True,
               "height": None, "tbr": None, "abr": None,
               "headers": dict(BASE_HEADERS), "cookies": None}]
+    if hd and d.get("play") and d.get("play") != media:
+        # A smaller no-watermark file is a real choice (data saver / quick share).
+        video.append({"format_id": "tikwm_sd", "ext": "mp4", "resolution": "~SD, no watermark",
+                      "url": d["play"], "filesize": _num(d.get("size")), "vcodec": None, "acodec": None,
+                      "has_audio": True, "ladder": "fast", "ip_free": True,
+                      "height": None, "tbr": None, "abr": None,
+                      "headers": dict(BASE_HEADERS), "cookies": None})
     audio = []
     if d.get("music"):
         audio.append({"format_id": "tikwm_music", "ext": "mp3", "resolution": "audio",
@@ -417,21 +427,21 @@ def ydl_opts(platform: str, audio_only: bool = False,
             opts["cookiefile"] = cf
         opts["format"] = custom_format or ("bestaudio/best" if audio_only else "best")
     elif platform == "youtube":
-        # Logged-in cookies do the heavy lifting (see YOUTUBE_COOKIES above):
-        # they carry account trust, so YouTube serves player responses even
-        # from flagged datacenter IPs. No PO-token server needed for the
-        # ANDROID-first client rotation.
+        # yt-dlp is the FALLBACK here (toolz-ytapi is primary, see
+        # extract_v1_sync). On a serverless Python runtime there is no JS
+        # runtime for yt-dlp's signature/n challenge solver, so only clients
+        # that serve plain URLs work: android_vr needs neither a PO token nor
+        # a JS runtime. The old ["android", "web"] pair could never produce a
+        # stream (android now demands a PO token; web is SABR-only).
         cf = _cookies_file(YOUTUBE_COOKIES, "yt_cookies.txt")
         if cf:
             opts["cookiefile"] = cf
         # Fallback chain, not just "best": many current videos have NO muxed
         # file (DASH-split only), where bare "best" hard-fails with
         # "Requested format is not available" before info is even returned.
-        # shape() ignores split merge pairs and ranks the ladder instead, so
-        # the default stays an honest best file, never a silent video track.
         opts["format"] = custom_format or (
             "bestaudio/best" if audio_only else "best/bestvideo+bestaudio")
-        opts["extractor_args"] = {"youtube": {"player_client": ["android", "web"]}}
+        opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv", "mweb"]}}
     return opts
 
 
@@ -610,6 +620,12 @@ def tiktok_gallery_shape(data: dict, url: str) -> Optional[dict]:
     if not images:
         return None
     author = data.get("author") or {}
+    # Slideshows are posted with a soundtrack; offer it as its own audio download.
+    music = [{"format_id": "tikwm_music", "ext": "mp3", "resolution": "audio",
+              "url": data["music"], "filesize": None, "vcodec": "none", "acodec": None,
+              "has_audio": False, "ladder": "fast", "ip_free": True,
+              "height": None, "tbr": None, "abr": None,
+              "headers": dict(BASE_HEADERS), "cookies": None}] if data.get("music") else []
     gallery = [{
         "format_id": f"gallery:{index}", "url": image, "headers": dict(BASE_HEADERS), "cookies": None,
         "ext": urllib.parse.urlparse(image).path.rsplit(".", 1)[-1].lower() or "jpg", "filesize": None,
@@ -621,7 +637,7 @@ def tiktok_gallery_shape(data: dict, url: str) -> Optional[dict]:
         "stats": {"view_count": _num(data.get("play_count")), "like_count": _num(data.get("digg_count")), "comment_count": _num(data.get("comment_count"))},
         "upload_date": None, "description": None, "download_url": gallery[0]["url"],
         "download_headers": dict(BASE_HEADERS), "download_cookies": None, "ext": gallery[0]["ext"],
-        "blocked": False, "formats": {"video": [], "audio": []}, "gallery": gallery, "original_url": url,
+        "blocked": False, "formats": {"video": [], "audio": music}, "gallery": gallery, "original_url": url,
     }
 
 
@@ -735,100 +751,137 @@ def extract_sync(url: str, audio_only: bool = False, custom_format: Optional[str
         raise RuntimeError(f"{msg[:250]} ({hint})")
 
 
-def _ytapi_should_retry(msg: str) -> bool:
-    """Fallback-worthy failures: wall + cipher/PO gaps. Never private/dead."""
-    global _YTAPI_RETRY_RE
-    if not YT_EXTRACT_URL:
-        return False
-    if _YTAPI_RETRY_RE is None:
-        _YTAPI_RETRY_RE = re.compile(
-            r"sign in|not a bot|login required|requested format|no video formats"
-            r"|po token|potoken|decipher|cipher|player response|empty",
-            re.IGNORECASE,
-        )
-    return bool(_YTAPI_RETRY_RE.search(msg or ""))
+YT_TICKET_TTL = 120       # seconds a signed download link stays valid
+YT_BUDGET = 50            # whole YouTube extraction (ytapi, then yt-dlp fallback)
+YT_FALLBACK_AFTER = 25    # don't start the yt-dlp fallback after this many seconds
+_YT_VERDICTS = ("private", "age", "region", "unavailable")
 
 
 def _ytapi_fetch(url: str) -> dict:
-    """Call the extraction microservice. Raises RuntimeError on any failure."""
-    payload = json.dumps({"url": url}).encode()
+    """Call the extraction microservice (contract v2). Raises RuntimeError on any failure."""
+    payload = json.dumps({"url": url, "v": 2}).encode()
     req = urllib.request.Request(
         YT_EXTRACT_URL + "/api/extract",
         data=payload,
         headers={"Content-Type": "application/json",
-                  "Authorization": f"Bearer {YTAPI_SECRET}"},
+                 "Authorization": f"Bearer {YTAPI_SECRET}"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=40) as res:
+        with urllib.request.urlopen(req, timeout=32) as res:
             body = json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # The service answers failures as JSON with a structured verdict.
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            raise RuntimeError(f"extraction service unreachable: HTTP {e.code}")
     except Exception as e:
         raise RuntimeError(f"extraction service unreachable: {str(e)[:120]}")
     if not body.get("ok"):
         raise RuntimeError(
             f"extraction service: {body.get('error', 'failed')}: "
-            f"{str(body.get('detail') or '')[:160]}"
+            f"{str(body.get('detail') or '')[:300]}"
         )
     data = body.get("data") or {}
-    if not (data.get("formats") or data.get("title")):
+    if not data.get("formats"):
         raise RuntimeError("extraction service returned no streams")
     return data
 
 
-def _ytapi_info(contract: dict, url: str) -> dict:
-    """Map the microservice contract to a yt-dlp-shaped info for shape()."""
-    fmts = []
-    for i, f in enumerate(contract.get("formats") or []):
-        if not isinstance(f, dict) or not f.get("url"):
+def youtube_shape(contract: dict, url: str, audio_only: bool = False) -> dict:
+    """
+    Build our response from the microservice contract (v2). Pure (no I/O).
+
+    Rows are `kind`-classified by the service: merged (video+audio muxed at
+    download time), progressive (one file with sound), video (silent adaptive
+    track) and audio. Silent video-only rows are listed ONLY for heights that
+    have no with-sound alternative, and default selection always prefers a
+    with-sound row — never a silent track when sound exists.
+
+    The `url` on every row is an opaque sentinel (`ytapi://<id>/<format>`):
+    googlevideo URLs are bound to the microservice's egress IP, so this API
+    never holds or fetches them. Downloads are redirected to the service
+    with a signed ticket (see _ytapi_download_url).
+    """
+    vid = contract.get("video_id") or _youtube_id(url) or ""
+    video: List[dict] = []
+    audio: List[dict] = []
+    for r in contract.get("formats") or []:
+        if not isinstance(r, dict) or not r.get("format_id"):
             continue
-        mime = str(f.get("mime") or "")
-        container = mime.split(";")[0].strip().split("/")[-1].lower() or "mp4"
-        ext = container if container in ("mp4", "webm", "m4a", "mp3", "3gp") else "mp4"
-        audio = bool(f.get("is_audio"))
-        bitrate = f.get("bitrate") or 0
+        fid = str(r["format_id"])
+        mime = str(r.get("mime") or "")
+        is_audio = bool(r.get("is_audio"))
+        ext = r.get("ext") or mime.split(";")[0].split("/")[-1].lower() or "mp4"
+        if is_audio and ext == "mp4":
+            ext = "m4a"
         codec = None
         m = re.search(r'codecs="([^"]+)"', mime)
         if m:
             codec = m.group(1).split(",")[0].strip().split(".")[0] or None
-        fmts.append({
-            "format_id": f"yta_{f.get('itag') or i}",
-            "ext": ext,
-            "resolution": f.get("quality_label") or ("audio" if audio else "unknown"),
-            "url": f["url"],
-            "filesize": f.get("content_length"),
-            "vcodec": "none" if audio else codec,
-            "acodec": codec if audio else None,
-            "has_audio": False if audio else f.get("has_audio"),
-            "height": f.get("height"), "width": f.get("width"),
+        bitrate = r.get("bitrate") or 0
+        row = {
+            "format_id": fid, "ext": ext,
+            "resolution": r.get("quality_label") or ("audio" if is_audio else "unknown"),
+            "url": f"ytapi://{vid}/{fid}",
+            "filesize": r.get("content_length"),
+            "vcodec": "none" if is_audio else (None if r.get("kind") == "merged" else codec),
+            "acodec": codec if is_audio else None,
+            "has_audio": False if is_audio else bool(r.get("has_audio")),
+            "height": r.get("height"), "width": r.get("width"),
             "tbr": (bitrate / 1000) if bitrate else None,
-            "abr": (bitrate / 1000) if (audio and bitrate) else None,
-            "fps": f.get("fps"),
-            "protocol": "https",
-            "http_headers": {},
-            "cookies": None,
-        })
+            "abr": (bitrate / 1000) if (is_audio and bitrate) else None,
+            "fps": r.get("fps"),
+            "mime_type": mime.split(";")[0].strip() or None,
+            "headers": {}, "cookies": None,
+        }
+        (audio if is_audio else video).append(row)
+    if not video and not audio:
+        raise RuntimeError("extraction service returned no streams")
+
+    sounded = {v["height"] for v in video if v["has_audio"]}
+    video = [v for v in video if v["has_audio"] or v["height"] not in sounded]
+    video.sort(key=lambda v: (v["height"] or 0, v["fps"] or 0, 1 if v["has_audio"] else 0,
+                              v["tbr"] or 0), reverse=True)
+    audio.sort(key=lambda a: (a["abr"] or 0, 1 if a["ext"] == "m4a" else 0), reverse=True)
+
+    with_sound = [v for v in video if v["has_audio"]]
+    if audio_only and audio:
+        best, best_group = audio[0], "audio"
+    elif video:
+        best, best_group = prefer_1080(with_sound or video)[0], "video"
+    else:
+        best, best_group = audio[0], "audio"
+
+    stats = {"view_count": contract.get("view_count"), "like_count": contract.get("like_count"),
+             "comment_count": contract.get("comment_count")}
     return {
-        "title": contract.get("title"),
-        "thumbnail": contract.get("thumbnail"),
-        "duration": contract.get("duration"),
-        "uploader": contract.get("uploader"),
-        "uploader_url": contract.get("uploader_url"),
-        "view_count": contract.get("view_count"),
-        "like_count": contract.get("like_count"),
-        "comment_count": contract.get("comment_count"),
+        "platform": "youtube", "source": "ytapi", "video_id": vid,
+        "title": contract.get("title"), "thumbnail": contract.get("thumbnail"),
+        "duration": contract.get("duration"), "uploader": contract.get("uploader"),
+        "uploader_url": contract.get("uploader_url"), "stats": stats,
         "upload_date": contract.get("upload_date"),
-        "description": contract.get("description"),
-        "ext": None,
-        "formats": fmts,
-        "entries": None,
+        "description": (contract.get("description") or "")[:400] or None,
+        "download_url": None, "download_headers": {}, "download_cookies": None,
+        "ext": best["ext"], "blocked": False,
+        "best_format": best["format_id"], "best_group": best_group,
+        "formats": {"video": video[:20], "audio": audio[:10]},
+        "original_url": url,
     }
+
+
+def _ytapi_fatal(msg: str) -> bool:
+    """A definitive verdict from the service — falling back to yt-dlp can't change it."""
+    m = re.search(r"extraction service:\s*(\w+):", msg or "")
+    return bool(m and m.group(1) in _YT_VERDICTS)
 
 
 def _ytapi_primary_error(ytapi_msg: str, ytdl_msg: str) -> RuntimeError:
     """Prefer the microservice's structured verdict over yt-dlp wall text."""
     m = re.search(r"extraction service:\s*(\w+):\s*(.*)", ytapi_msg)
     if not m:
-        return RuntimeError(f"YouTube extraction failed: {ytdl_msg[:260]} [{ytapi_msg[:120]}]")
+        return RuntimeError(f"YouTube extraction failed: {ytdl_msg[:200]} [{ytapi_msg[:200]}]")
     code, detail = m.group(1), m.group(2).strip()
     if code == "private":
         return RuntimeError("This YouTube video is private.")
@@ -836,75 +889,68 @@ def _ytapi_primary_error(ytapi_msg: str, ytdl_msg: str) -> RuntimeError:
         return RuntimeError(f"This YouTube video is age-restricted ({detail[:120]}).")
     if code == "region":
         return RuntimeError(f"This YouTube video is blocked in this region ({detail[:120]}).")
+    if code == "unavailable":
+        return RuntimeError(
+            "This YouTube video doesn't exist, is private, or was removed. "
+            f"Check the link and try a public video. ({detail[:120]})")
     if code == "login":
         return RuntimeError(
             "YouTube demanded sign-in for this video even with session cookies — "
             "re-export YOUTUBE_COOKIES from the throwaway account and redeploy. "
             f"({detail[:120]})"
         )
-    return RuntimeError(f"YouTube extraction failed: {ytdl_msg[:260]} [{code}: {detail[:120]}]")
+    tail = f" | yt-dlp: {ytdl_msg[:160]}" if ytdl_msg else ""
+    return RuntimeError(f"YouTube extraction failed: [{code}] {detail[:300]}{tail}")
 
 
-def _ytapi_recheck_streams(shaped: dict) -> None:
-    """Best-effort GVS check: HEAD the default stream (browser UA + Range).
-
-    Raises only on a definitive HTTP 403 (playback gate without a usable
-    token). Transport errors/timeouts are inconclusive — the download path
-    reports those honestly, so never block on them here.
+def _ytapi_download_url(video_id: str, format_id: str, filename: str,
+                        height: Optional[int] = None) -> str:
     """
-    media = shaped.get("download_url")
-    if not media:
-        return
-    try:
-        req = urllib.request.Request(
-            media,
-            headers={"User-Agent": UA, "Range": "bytes=0-0"},
-            method="HEAD",
-        )
-        with urllib.request.urlopen(req, timeout=8):
-            return  # reachable: proceed
-    except urllib.error.HTTPError as e:
-        if e.code == 403:
-            raise RuntimeError(
-                "Streams were found but Google refuses playback from servers "
-                "for this video (GVS gate). Try again later or another video."
-            )
-        return  # other HTTP answers are inconclusive here
-    except Exception:
-        return  # inconclusive — proceed; download reports real failures
+    Signed, short-lived link to the microservice's streaming endpoint.
+
+    googlevideo URLs only work from the IP that extracted them, so the one
+    process that may download is the microservice itself — it re-extracts
+    inside the download request and streams. Wire format matches
+    toolz-ytapi/lib/ticket.js: b64url(JSON) "." b64url(HMAC-SHA256).
+    """
+    if not (YT_EXTRACT_URL and YTAPI_SECRET):
+        raise HTTPException(503, "YouTube downloads need YT_EXTRACT_URL and YTAPI_SECRET to be configured.")
+    payload = {"v": video_id, "f": format_id, "n": filename, "e": int(time.time()) + YT_TICKET_TTL}
+    if height:
+        payload["h"] = int(height)
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    sig = base64.urlsafe_b64encode(
+        hmac.new(YTAPI_SECRET.encode(), body.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+    return f"{YT_EXTRACT_URL}/api/extract?t={body}.{sig}"
 
 
 def extract_v1_sync(url: str, audio_only: bool = False) -> dict:
     """Versioned extraction entry point. Legacy routes remain TikTok/IG-only."""
     platform = detect_v1_platform(url)
     if platform == "youtube":
+        started = time.monotonic()
+        ytapi_msg = ""
+        if YT_EXTRACT_URL:
+            # Primary: youtubei.js service. It verifies every stream against
+            # googlevideo from the IP that will later download it, so a
+            # result is never "formats that 403".
+            try:
+                return youtube_shape(_ytapi_fetch(url), url, audio_only)
+            except RuntimeError as e:
+                ytapi_msg = str(e)
+            except Exception as e:  # defensive: shaping bugs must not mask the fallback
+                ytapi_msg = f"extraction service: failed: {str(e)[:160]}"
+            if _ytapi_fatal(ytapi_msg):
+                raise _ytapi_primary_error(ytapi_msg, "")
+            if time.monotonic() - started > YT_FALLBACK_AFTER:
+                raise _ytapi_primary_error(ytapi_msg, "skipped: time budget")
         try:
             info = run_ydl(ydl_opts("youtube", audio_only), url)
             return gallery_shape(platform, info, url) or shape(platform, info, url)
         except Exception as exc:
             msg = str(exc).replace("ERROR: ", "")
-            if _ytapi_should_retry(msg):
-                # yt-dlp found nothing usable (cipher-only streams are the
-                # usual cause on serverless: no JS runtime to decipher).
-                # youtubei.js deciphers natively — try the microservice.
-                try:
-                    contract = _ytapi_fetch(url)
-                    info = _ytapi_info(contract, url)
-                    shaped = gallery_shape(platform, info, url) or shape(platform, info, url)
-                    if (shaped.get("download_url") or shaped.get("formats", {}).get("video")
-                            or shaped.get("formats", {}).get("audio")):
-                        _ytapi_recheck_streams(shaped)
-                        return shaped
-                except RuntimeError as e2:
-                    # Structured microservice verdicts (private/age/region/
-                    # login) are more precise than yt-dlp's wall text — they
-                    # become the primary error. The GVS verdict already speaks
-                    # for itself and propagates untouched.
-                    if "GVS gate" in str(e2):
-                        raise
-                    raise _ytapi_primary_error(str(e2), msg)
-                except Exception as e2:
-                    msg += f" [fallback: {str(e2)[:120]}]"
+            if ytapi_msg:
+                raise _ytapi_primary_error(ytapi_msg, msg)
             if "Requested format is not available" in msg or "no video formats" in msg.lower():
                 # yt-dlp found zero usable streams. Distinguish a dead link
                 # (oEmbed 404s too) from a genuine extraction refusal so the
@@ -1010,6 +1056,74 @@ def _asset_record(asset_id: str, kind: str, fmt: dict, source_format: str) -> di
     }
 
 
+_FFMPEG: Optional[str] = ""  # "" = not looked up yet, None = unavailable
+
+
+def ffmpeg_path() -> Optional[str]:
+    """
+    Optional ffmpeg for merging split tracks. Order: FFMPEG_PATH env, the
+    `imageio-ffmpeg` wheel (bundles a static binary), then PATH. Absent means
+    split-track merging is simply not offered — nothing else changes.
+    """
+    global _FFMPEG
+    if _FFMPEG != "":
+        return _FFMPEG
+    cand = (os.getenv("FFMPEG_PATH") or "").strip() or None
+    if not cand:
+        try:
+            import imageio_ffmpeg  # type: ignore
+            cand = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            cand = shutil.which("ffmpeg")
+    _FFMPEG = cand if cand and os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+    return _FFMPEG
+
+
+def _mux_pairs(result: dict) -> List[dict]:
+    """
+    Synthetic "video + audio" rows for yt-dlp sources that only offer split
+    tracks at their top qualities (Instagram DASH, YouTube fallback). Only
+    built when ffmpeg exists, only for heights with no with-sound row, one
+    per (height, container), always paired with the best same-family audio
+    so stream-copy muxing is legal. v1 only: legacy routes never see them.
+    """
+    if result.get("source") == "ytapi" or result.get("gallery") or not ffmpeg_path():
+        return []
+    fm = result.get("formats") or {}
+    video, audio = fm.get("video") or [], fm.get("audio") or []
+
+    def ext(r: dict) -> str:
+        return str(r.get("ext") or "").lower()
+
+    pools = {
+        "mp4": [a for a in audio if a.get("url") and ext(a) in ("m4a", "mp4", "aac")],
+        "webm": [a for a in audio if a.get("url") and ext(a) in ("webm", "opus")],
+    }
+    sounded = {v.get("height") for v in video
+               if v.get("has_audio") is True or v.get("acodec") not in (None, "none")}
+    out: List[dict] = []
+    seen = set()
+    for v in video:
+        if not v.get("url") or v.get("acodec") != "none" or not v.get("height") or v["height"] in sounded:
+            continue
+        cont = "webm" if ext(v) == "webm" else "mp4"
+        if not pools[cont] or (v["height"], cont) in seen:
+            continue
+        seen.add((v["height"], cont))
+        a = pools[cont][0]  # lists arrive sorted best-first
+        both = v.get("filesize") and a.get("filesize")
+        out.append({
+            "format_id": f"mux:{v['format_id']}+{a['format_id']}", "ext": cont,
+            "resolution": v.get("resolution"), "url": v["url"],
+            "filesize": (v["filesize"] + a["filesize"]) if both else None,
+            "vcodec": v.get("vcodec"), "acodec": a.get("acodec"), "has_audio": True,
+            "height": v["height"], "width": v.get("width"), "tbr": v.get("tbr"), "fps": v.get("fps"),
+            "headers": {}, "cookies": None, "mux": True,
+            "_video": v, "_audio": a,  # internal: never copied into assets
+        })
+    return out
+
+
 def make_v1_extraction(source_url: str, result: dict, owner_installation_hash: str) -> dict:
     """Persist private upstream details but return only opaque asset handles."""
     extraction_id = secrets.token_urlsafe(18)
@@ -1018,7 +1132,21 @@ def make_v1_extraction(source_url: str, result: dict, owner_installation_hash: s
         "ext": result.get("ext"), "filesize": None, "duration": result.get("duration"),
         "has_audio": not bool(result.get("gallery")), "thumbnail": result.get("thumbnail"),
     }
-    asset_map["best"] = _asset_record("best", "video", best, "best")
+    best_kind, best_source = "video", "best"
+    best_id = result.get("best_format")
+    if best_id:
+        # Sources that pick their own default (YouTube) describe it truthfully
+        # instead of a generic "best" with unknown properties.
+        for group in ("video", "audio"):
+            row = next((f for f in result.get("formats", {}).get(group, [])
+                        if str(f.get("format_id")) == str(best_id)), None)
+            if row:
+                best.update({k: row.get(k) for k in ("ext", "filesize", "width", "height",
+                                                     "resolution", "vcodec", "acodec", "mime_type")})
+                best["has_audio"] = True if group == "video" and row.get("has_audio") else bool(row.get("has_audio"))
+                best_kind, best_source = group, str(best_id)
+                break
+    asset_map["best"] = _asset_record("best", best_kind, best, best_source)
     for group, kind in (("video", "video"), ("audio", "audio")):
         for index, fmt in enumerate(result.get("formats", {}).get(group, [])):
             fmt_id = str(fmt.get("format_id") or "")
@@ -1026,6 +1154,9 @@ def make_v1_extraction(source_url: str, result: dict, owner_installation_hash: s
                 continue
             asset_id = f"{kind[0]}_{index}_{hashlib.sha256(fmt_id.encode()).hexdigest()[:8]}"
             asset_map[asset_id] = _asset_record(asset_id, kind, fmt, fmt_id)
+    for index, fmt in enumerate(_mux_pairs(result)):
+        asset_id = f"m_{index}_{hashlib.sha256(fmt['format_id'].encode()).hexdigest()[:8]}"
+        asset_map[asset_id] = _asset_record(asset_id, "video", fmt, fmt["format_id"])
     for index, item in enumerate(result.get("gallery", [])):
         if not item.get("url"):
             continue
@@ -1278,9 +1409,18 @@ async def download_v1_asset(extraction_id: str, asset_id: str, request: Request)
     title = _sanitize_name(record.get("result", {}).get("title") or "media")
     suffix = f"-{asset_id}" if asset.get("kind") == "image" else ""
     filename = f"{title}{suffix}.{asset.get('ext') or 'mp4'}"
+    result = record.get("result") or {}
+    if result.get("source") == "ytapi":
+        # googlevideo bytes may only be fetched by the process that extracted
+        # them (IP-bound): hand the client a signed ticket to that service.
+        return RedirectResponse(
+            _ytapi_download_url(str(result.get("video_id") or ""), str(asset["format"]),
+                                filename, asset.get("height")),
+            status_code=307, headers={"Cache-Control": "no-store"},
+        )
     return await _stream_download(
         request, record["source_url"], str(asset["format"]), filename,
-        str(record.get("result", {}).get("platform") or ""), v1=True,
+        str(result.get("platform") or ""), v1=True,
     )
 
 
@@ -1292,6 +1432,59 @@ async def download_v1_asset(extraction_id: str, asset_id: str, request: Request)
 def _sanitize_name(name: str) -> str:
     keep = "".join(c if (c.isalnum() or c in " ._-") else " " for c in name)
     return (" ".join(keep.split()) or "media")[:120]
+
+
+async def _mux_download(resolve, format_id: str, filename: str):
+    """Stream a merged video+audio file: ffmpeg stream-copies two tracks, no re-encode, no temp file."""
+    plan = None
+    for fresh in (False, True):
+        result = await resolve(fresh)
+        plan = next((p for p in _mux_pairs(result) if p["format_id"] == format_id), None)
+        if plan:
+            break
+    if not plan:
+        raise HTTPException(404, "That quality is no longer listed. Extract again.")
+    ff = ffmpeg_path()
+    if not ff:
+        raise HTTPException(501, "Merging video and audio isn't available on this server.")
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    for fmt in (plan["_video"], plan["_audio"]):
+        hdrs = dict(fmt.get("headers") or {})
+        if fmt.get("cookies"):
+            hdrs["Cookie"] = fmt["cookies"]
+        if hdrs:
+            cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in hdrs.items())]
+        cmd += ["-i", fmt["url"]]
+    cont = plan["ext"]
+    cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c", "copy"]
+    cmd += ["-f", "webm"] if cont == "webm" else \
+        ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4"]
+    cmd += ["pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    loop = asyncio.get_running_loop()
+    # First bytes decide success: a refusal becomes a clean error, not an empty "download".
+    first = await loop.run_in_executor(None, proc.stdout.read, 65536)
+    if not first:
+        err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[:160]
+        proc.kill()
+        raise HTTPException(502, f"Could not merge the video and audio tracks ({err or 'source refused'}). Extract again.")
+
+    def _iter():
+        try:
+            yield first
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.kill()
+            proc.wait()
+
+    return StreamingResponse(_iter(), media_type="video/webm" if cont == "webm" else "video/mp4", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(_sanitize_name(filename))}",
+        "Cache-Control": "no-store", "Accept-Ranges": "none",
+    })
 
 
 async def _stream_download(request: Request, page_url: str, f: str, n: str, platform: str, v1: bool = False):
@@ -1311,7 +1504,7 @@ async def _stream_download(request: Request, page_url: str, f: str, n: str, plat
             try:
                 result = await asyncio.wait_for(
                     loop.run_in_executor(None, lambda: extract_v1_sync(page_url) if v1 else extract_sync(page_url)),
-                    timeout=max(EXTRACT_TIMEOUT, 5),
+                    timeout=YT_BUDGET if platform == "youtube" else max(EXTRACT_TIMEOUT, 5),
                 )
             except asyncio.TimeoutError:
                 raise HTTPException(504, f"Preparing the download timed out (~{EXTRACT_TIMEOUT}s). Tap Download once more — retries usually succeed.")
@@ -1353,6 +1546,9 @@ async def _stream_download(request: Request, page_url: str, f: str, n: str, plat
         if range_header:
             h2["Range"] = range_header
         return h2
+
+    if f.startswith("mux:"):
+        return await _mux_download(_resolve, f, n)
 
     strategies = [("cached", False), ("fresh", True)]
     for label, fresh in strategies:
