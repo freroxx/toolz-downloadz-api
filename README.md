@@ -1,83 +1,98 @@
+<div align="center">
+
+<img src="https://i.ibb.co/jvt7B2Cy/toolz-glass-icon-dark-bg.png" width="80" alt="Toolz Logo" />
+
 # toolz-downloadz-api
 
-Media-extraction API for public TikTok and Instagram media. FastAPI, built for Vercel serverless.
+**Media-extraction API for TikTok, Instagram & YouTube — FastAPI on Vercel Serverless**
+
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org)
+[![Vercel](https://img.shields.io/badge/Vercel-Serverless-000000?style=flat-square&logo=vercel&logoColor=white)](https://vercel.com)
+[![License: GPL v3](https://img.shields.io/badge/License-GPL--3.0-4CAF50?style=flat-square&logo=gnu&logoColor=white)](LICENSE)
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ffreroxx%2Ftoolz-downloadz-api&env=API_SECRET_KEY,INSTAGRAM_COOKIES)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-Companion frontend: [freroxx/toolz-downloadz](https://github.com/freroxx/toolz-downloadz)
+</div>
 
-## How it works
+---
+
+## 🌐 Overview
+
+`toolz-downloadz-api` is the backend media-extraction engine powering the [Toolz](https://github.com/freroxx/toolz) suite. It extracts no-watermark media from **TikTok**, **Instagram**, and **YouTube** using a layered fallback strategy, exposes a clean REST API with auth, rate limiting, and Redis-backed session state, and deploys as a single-file Vercel serverless function.
+
+> **Part of the Toolz ecosystem** — a modern, open-source media downloader suite built with Material 3 Expressive design.
+
+---
+
+## 🏗️ Architecture
 
 ```
-GET /api/extract?url=…
-  TikTok    → tikwm API (no-watermark, IP-free CDN)
-              → fallback: yt-dlp → fallback: oEmbed (blocked: true)
-  Instagram → yt-dlp (+ INSTAGRAM_COOKIES)
-
-GET /api/download?u=…&f=best
-  Re-resolves on the same instance and streams the bytes.
-  Same-instance matters: TikTok signs media URLs to the extracting
-  server's IP, so a separate proxy gets 403.
+                        ┌─────────────────────────────────────────────────┐
+                        │               toolz-downloadz-api                │
+                        │              FastAPI · Vercel · Python            │
+                        └───────────────────┬─────────────────────────────┘
+                                            │
+              ┌─────────────────────────────┼──────────────────────────────┐
+              │                             │                              │
+     ┌────────▼────────┐          ┌─────────▼────────┐          ┌─────────▼────────┐
+     │    🎵 TikTok    │          │  📸 Instagram    │          │   ▶️  YouTube    │
+     │                 │          │                  │          │                  │
+     │ 1. tikwm API    │          │ 1. yt-dlp        │          │ 1. yt-dlp        │
+     │    (no-wm CDN)  │          │    + cookies     │          │    + cookies     │
+     │ 2. yt-dlp       │          │                  │          │ 2. cobalt engine │
+     │    fallback     │          │                  │          │    fallback      │
+     │                 │          │                  │          │ 3. youtubei.js   │
+     │                 │          │                  │          │    (toolz-ytapi) │
+     └────────┬────────┘          └─────────┬────────┘          └─────────┬────────┘
+              │                             │                              │
+              └─────────────────────────────┼──────────────────────────────┘
+                                            │
+                        ┌───────────────────▼─────────────────────────────┐
+                        │          Unified Extraction Response             │
+                        │    formats · assets · duration · thumbnail       │
+                        └───────────────────┬─────────────────────────────┘
+                                            │
+              ┌─────────────────────────────┼──────────────────────────────┐
+              │                             │                              │
+     ┌────────▼────────┐          ┌─────────▼────────┐          ┌─────────▼────────┐
+     │  Auth & Limits  │          │  In-memory Cache │          │  Upstash Redis   │
+     │                 │          │  (per instance)  │          │  (v1 sessions)   │
+     │ X-API-KEY       │          │  TTL: CACHE_TTL  │          │  Guest tokens    │
+     │ Bearer token    │          │                  │          │  Extraction hdls │
+     │ ?key= param     │          │                  │          │                  │
+     └─────────────────┘          └──────────────────┘          └──────────────────┘
 ```
 
-The v1 API supports individual gallery images as ordered assets, as well as native source video and audio formats. It does not transcode or mux on Vercel.
+---
 
-## v1 client contract
+## ✨ Key Features
 
-New Android and web clients must use v1. It never exposes upstream media URLs,
-cookies, or a project API secret:
+- 🎵 **TikTok** — tikwm API (no-watermark, IP-free CDN) with full yt-dlp quality ladder merged in; yt-dlp fallback
+- 📸 **Instagram** — yt-dlp extraction with Netscape cookie support for authenticated content
+- ▶️ **YouTube** — yt-dlp primary → cobalt engine fallback → youtubei.js via `toolz-ytapi` fallback
+- 🔐 **Auth** — `X-API-KEY` header, `Authorization: Bearer`, or `?key=` query param
+- ⚡ **Rate limiting** — per-IP, configurable requests/minute (via `X-Forwarded-For`)
+- 💾 **Caching** — in-memory per-instance extraction cache with configurable TTL
+- 🔗 **v1 Client Contract** — sessions → extractions → downloads; upstream URLs never exposed
+- 🗄️ **Upstash Redis** — distributed session/extraction state for production multi-instance deploys
+- 🛡️ **SSRF protection** — blocked private/internal hosts
+- 📦 **Single-file deploy** — entire app in `api/index.py`; Vercel-native with `maxDuration: 60`
 
-1. `POST /api/v1/client-sessions` with an opaque, stable installation ID.
-2. `POST /api/v1/extractions` with `Authorization: Bearer <guest token>` and a public URL.
-3. Select an opaque `assets[].id` and download it at its returned `download_path` with the same bearer token.
+---
 
-Guest tokens and extraction handles are short-lived. In production set
-`UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`; in-memory state is intended only for local development. `/api/extract` and `/api/download` remain legacy compatibility routes during client rollout.
+## 🗺️ API Endpoints
 
-Tikwm reports byte counts and duration but no dimensions or codecs, so TikTok quality labels are approximate and carry a `~` prefix. Anything unobserved is `null`, never guessed.
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/api/health` | Optional | Status, version, platforms, cookie flags |
+| `GET` | `/api/platforms` | Optional | Supported platform list |
+| `GET` `POST` | `/api/extract` | Required | Extract media info and format ladder |
+| `GET` | `/api/download` | Required | Stream media bytes as attachment (supports `Range`) |
+| `POST` | `/api/v1/client-sessions` | — | Create guest session with opaque install ID |
+| `POST` | `/api/v1/extractions` | Bearer | Submit URL, get opaque asset handles + download paths |
 
-## Deploy
-
-1. Import this repo in Vercel (Framework Preset: Other, no build command).
-2. Set the env vars below, deploy.
-3. Check `GET https://<your-api>.vercel.app/api/health`.
-
-`vercel.json` sets `maxDuration: 60` and routes everything to `api/index.py`, which is the entire app in one file (Vercel's Python builder is unreliable with packages under `api/`).
-
-### Env vars
-
-| Variable | Required | Default | Notes |
-|---|---|---|---|
-| `API_SECRET_KEY` | yes | — | `openssl rand -hex 32`. Must match the frontend. Unset = no auth (local dev only). |
-| `YOUTUBE_COOKIES` | for YouTube | — | Full Netscape `cookies.txt` from a browser logged into a **throwaway** Google account (never your main). Same pattern as Instagram: export with "Get cookies.txt LOCALLY", paste whole file content, redeploy. Rotate when bot-wall errors return. |
-| `YT_EXTRACT_URL` / `YTAPI_SECRET` | YouTube decipher fallback | — | Deployed `toolz-ytapi` URL + shared secret (must match on both sides). When yt-dlp finds zero usable formats (ciphered streams need JS deciphering), the API retries via youtubei.js (which mints its own PO tokens in-process). Unset = yt-dlp only. |
-| `INSTAGRAM_COOKIES` | for IG | — | Full Netscape `cookies.txt` from a logged-in instagram.com browser. TikTok needs nothing. |
-| `EXTRACT_TIMEOUT` | no | `26` | Seconds before extraction gives up. |
-| `CACHE_TTL` | no | `3600` | Cache seconds for successful extractions (in-memory, per instance). |
-| `RATE_LIMIT` | no | `30` | Requests per minute per IP (uses `X-Forwarded-For` behind Vercel). |
-| `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` | v1 production | — | Upstash Redis REST state for sessions and short-lived extraction handles. |
-
-Instagram cookies: log in to instagram.com, export with "Get cookies.txt LOCALLY", paste the whole file content as the var, redeploy. Never commit cookies; the API only reads them into `/tmp` for yt-dlp.
-
-## Local dev
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # set API_SECRET_KEY
-uvicorn api.index:app --reload   # docs at http://localhost:8000/docs
-PYTHONPATH=. pytest -q
-```
-
-## API reference
-
-Auth via `X-API-KEY`, `Authorization: Bearer`, or `?key=` (the last one exists so browser-navigated downloads can authenticate).
-
-`GET /api/health` returns status, version, platforms, and whether IG cookies are set.
-
-`GET /api/platforms` returns `[{id: tiktok}, {id: instagram}]`.
-
-`GET /api/extract?url=…&audio_only=false&format=` (or `POST /api/extract` with `{"url": …}`) returns:
+### `/api/extract` Response Shape
 
 ```json
 {
@@ -91,33 +106,164 @@ Auth via `X-API-KEY`, `Authorization: Bearer`, or `?key=` (the last one exists s
   "ext": "mp4",
   "blocked": false,
   "formats": {
-    "video": [{ "format_id": "tikwm_hd", "ext": "mp4", "resolution": "~1080p HD, no watermark", "url": "…", "filesize": 4561873, "has_audio": true }],
-    "audio": [{ "format_id": "tikwm_music", "ext": "mp3", "resolution": "audio", "url": "…", "filesize": null }]
+    "video": [
+      {
+        "format_id": "tikwm_hd",
+        "ext": "mp4",
+        "resolution": "~1080p HD, no watermark",
+        "url": "…",
+        "filesize": 4561873,
+        "has_audio": true,
+        "ladder": "fast",
+        "ip_free": true
+      }
+    ],
+    "audio": [
+      { "format_id": "tikwm_music", "ext": "mp3", "resolution": "audio", "url": "…", "filesize": null }
+    ]
   },
   "original_url": "https://…"
 }
 ```
 
-With `audio_only=true`, the TikTok response serves the music track as `download_url` (ext `mp3`).
+### Status Codes
 
-TikTok extracts always include the full quality ladder: exact yt-dlp rungs (dimensions, sizes, codecs, e.g. 540p / 720p H.264 / 720p HEVC / 1080p) merged into the fast tikwm result. Exact rows supersede the approximate ones, duplicates and the watermarked variant are dropped, and the default download stays the IP-free HD file. Rows carry `ladder: fast|full` and `ip_free` flags; video rows carry explicit `has_audio`. Only exact file sizes are ever reported. Default quality is 1080p wherever a 1080 rendition exists, highest available otherwise.
+| Code | Meaning |
+|------|---------|
+| `400` | Unsupported URL / SSRF-blocked host / slideshow / IG failure |
+| `401` | Invalid or missing API key |
+| `409` | Attempting to download a blocked extraction |
+| `429` | Rate limit exceeded |
+| `502` | Upstream CDN refused |
+| `504` | Extraction timed out — retry (cache makes retries instant) |
 
-Status codes: `400` unsupported URL / SSRF-blocked host / slideshow / Instagram failure (includes the cookie setup hint); `401` bad key; `409` downloading a blocked extraction; `429` rate limited; `502` CDN refused; `504` timed out (retry, cache makes retries faster).
+---
 
-`GET /api/download?u=…&f=best&n=name.mp4` streams the file as an attachment. `f` is a `format_id` from extract (default `best`). Supports `Range`.
+## 🔑 Environment Variables
 
-## Project structure
+| Variable | Required | Default | Notes |
+|----------|----------|---------|-------|
+| `API_SECRET_KEY` | **Yes** | — | `openssl rand -hex 32`. Must match the frontend. Unset = no auth (local dev only). |
+| `YOUTUBE_COOKIES` | For YouTube | — | Full Netscape `cookies.txt` from a **throwaway** Google account. Export via "Get cookies.txt LOCALLY", paste entire file content. Rotate when bot-wall errors appear. |
+| `YT_EXTRACT_URL` | YT fallback | — | Deployed `toolz-ytapi` URL for youtubei.js decipher fallback. |
+| `YTAPI_SECRET` | YT fallback | — | Shared secret for `toolz-ytapi` (must match on both sides). |
+| `INSTAGRAM_COOKIES` | For Instagram | — | Full Netscape `cookies.txt` from a logged-in instagram.com session. Never commit cookies. |
+| `EXTRACT_TIMEOUT` | No | `26` | Seconds before extraction is abandoned. |
+| `CACHE_TTL` | No | `3600` | In-memory cache lifetime (seconds) for successful extractions. |
+| `RATE_LIMIT` | No | `30` | Max requests per minute per IP. |
+| `UPSTASH_REDIS_REST_URL` | v1 production | — | Upstash Redis REST endpoint for distributed session/extraction state. |
+| `UPSTASH_REDIS_REST_TOKEN` | v1 production | — | Upstash Redis REST auth token. |
+
+> [!IMPORTANT]
+> **Never commit cookies or `API_SECRET_KEY` to source control.** The API reads `INSTAGRAM_COOKIES` and `YOUTUBE_COOKIES` into `/tmp` at runtime for yt-dlp. Rotate cookies immediately if bot-wall errors appear in logs.
+
+---
+
+## 🔄 v1 Client Contract
+
+New Android and web clients **must** use the v1 API. It never exposes upstream media URLs, cookies, or the project API secret to the calling client.
 
 ```
-api/index.py       # the whole app: routes, extraction, download, cache, auth
-tests/test_api.py  # pytest suite (offline unit tests + live smoke tests)
-.env.example       # documented env template
-requirements.txt   # fastapi, uvicorn, yt-dlp, python-dotenv
-vercel.json        # maxDuration + rewrites
+1.  POST /api/v1/client-sessions
+        Body: { "install_id": "<opaque stable installation ID>" }
+        → { "token": "<short-lived guest bearer token>" }
+
+2.  POST /api/v1/extractions
+        Headers: Authorization: Bearer <guest token>
+        Body: { "url": "<public media URL>" }
+        → { "assets": [{ "id": "…", "download_path": "/api/download?…" }], … }
+
+3.  GET <assets[n].download_path>
+        Headers: Authorization: Bearer <guest token>
+        → streams media bytes
 ```
 
-Contributions: fork, branch, `PYTHONPATH=. pytest -q`, PR with test evidence. Keep `api/index.py` single-file and dependency-light.
+> [!NOTE]
+> Guest tokens and extraction handles are **short-lived**. In production, set `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`. In-memory state is for local dev only. `/api/extract` and `/api/download` remain available as legacy compatibility routes during client rollout.
 
-Legal: only download content you own or have the right to save. Respect TikTok/Instagram ToS and creators' rights. Not affiliated with TikTok, Meta, Vercel, or tikwm.
+---
 
-License: [GPL-3.0](LICENSE).
+## 🚀 Deploy to Vercel
+
+1. Click the button below (or import this repo manually in Vercel):
+
+   [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ffreroxx%2Ftoolz-downloadz-api&env=API_SECRET_KEY,INSTAGRAM_COOKIES)
+
+2. **Framework Preset:** `Other` — no build command needed.
+3. Set environment variables (at minimum `API_SECRET_KEY`).
+4. Deploy, then verify:
+
+```bash
+curl https://<your-api>.vercel.app/api/health
+```
+
+> `vercel.json` sets `maxDuration: 60` and routes all traffic to `api/index.py`. The app is intentionally single-file because Vercel's Python builder is unreliable with sub-packages under `api/`.
+
+---
+
+## 💻 Local Development
+
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Configure environment
+cp .env.example .env
+#    → set API_SECRET_KEY (and optional cookie vars)
+
+# 3. Start dev server
+uvicorn api.index:app --reload
+#    → API docs at http://localhost:8000/docs
+
+# 4. Run tests
+PYTHONPATH=. pytest -q
+```
+
+---
+
+## 📁 Project Structure
+
+```
+toolz-downloadz-api/
+├── api/
+│   └── index.py        # Entire app: routes, extraction, download, cache, auth
+├── tests/
+│   └── test_api.py     # pytest suite (offline unit tests + live smoke tests)
+├── .env.example        # Documented environment variable template
+├── requirements.txt    # fastapi, uvicorn, yt-dlp, python-dotenv, …
+└── vercel.json         # maxDuration: 60 + route rewrites
+```
+
+---
+
+## 🔗 Toolz Ecosystem
+
+| Repo | Role |
+|------|------|
+| [freroxx/toolz](https://github.com/freroxx/toolz) | 📱 Main Toolz app |
+| [freroxx/toolz-downloadz](https://github.com/freroxx/toolz-downloadz) | 🌐 Frontend web client |
+| [freroxx/toolz-downloadz-api](https://github.com/freroxx/toolz-downloadz-api) | ⚙️ **This repo** — media extraction API |
+| [freroxx/toolz-ytapi](https://github.com/freroxx/toolz-ytapi) | ▶️ YouTube youtubei.js decipher service |
+| [freroxx/toolz-cobalt](https://github.com/freroxx/toolz-cobalt) | 🔧 Cobalt engine fork |
+| [freroxx/toolz-pot](https://github.com/freroxx/toolz-pot) | 🪙 YouTube PO Token provider |
+
+---
+
+## 🤝 Contributing
+
+1. Fork the repo and create a feature branch.
+2. Make changes — keep `api/index.py` single-file and dependency-light.
+3. Run tests: `PYTHONPATH=. pytest -q`
+4. Open a PR with test evidence.
+
+---
+
+## ⚖️ Legal
+
+Only download content you own or have the right to save. Respect TikTok, Instagram, and YouTube Terms of Service and creators' rights. This project is **not affiliated** with TikTok, Meta, Google, Vercel, or tikwm.
+
+<div align="center">
+
+Licensed under [GPL-3.0](LICENSE)
+
+</div>
