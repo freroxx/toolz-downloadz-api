@@ -1,0 +1,34 @@
+name: "API Feature Proposal"
+description: "Suggest a new format capability, performance improvement, or API endpoint"
+title: "[Proposal]: "
+labels: ["enhancement"]
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: "Proposal Summary"
+      placeholder: "e.g. Add support for audio-only M4A transcode or improve TikTok gallery pagination"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem / Use Case"
+      description: "What workflow does this enable for client apps?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-api-spec
+    attributes:
+      label: "Proposed API Specification"
+      description: "Describe proposed request/response schema or behavior."
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: "Checklist"
+      options:
+        - label: "I confirm this proposal does not involve DRM circumvention or paywall bypassing."
+          required: true

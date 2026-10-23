@@ -1,0 +1,68 @@
+name: "API Bug Report"
+description: "Report an extraction failure, API error, or unexpected response"
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues before reporting.
+        For security issues (SSRF, auth bypass), refer to [SECURITY.md](../../SECURITY.md).
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: "Target Platform"
+      description: "Which platform's extraction is failing?"
+      options:
+        - "TikTok"
+        - "Instagram"
+        - "YouTube"
+        - "API General (Auth, Session, Redis, Rate Limiting)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: "Failing Endpoint"
+      options:
+        - "POST /api/v1/extractions"
+        - "GET /api/v1/assets/{id}/download"
+        - "GET /api/extract (legacy)"
+        - "GET /api/download (legacy)"
+        - "GET /api/health"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-details
+    attributes:
+      label: "Error Response / Status Code"
+      description: "Paste the HTTP status code and response JSON received from the API."
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Reproduction Steps / Curl Command"
+      description: "Do NOT share real user session cookies or secret API keys."
+      placeholder: |
+        curl -X POST https://your-api.vercel.app/api/v1/extractions \
+          -H "Authorization: Bearer <token>" \
+          -d '{"url":"https://..."}'
+      render: shell
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: "Legal & Sanity Check"
+      options:
+        - label: "I confirm this issue does not expose any private cookies, credentials, or API secret keys."
+          required: true
+        - label: "I confirm this request is for personal/archival testing and does not violate copyright terms."
+          required: true

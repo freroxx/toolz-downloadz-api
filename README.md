@@ -13,6 +13,13 @@
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ffreroxx%2Ftoolz-downloadz-api&env=API_SECRET_KEY,INSTAGRAM_COOKIES)
 
+<p align="center">
+  <a href="https://discord.gg/aAswRUerwh">💬 Discord</a> &nbsp;·&nbsp;
+  <a href="https://github.com/freroxx/toolz">📱 Main App</a> &nbsp;·&nbsp;
+  <a href="https://github.com/freroxx/toolz-downloadz">🌐 Frontend</a> &nbsp;·&nbsp;
+  <a href="CONTRIBUTING.md">🤝 Contributing</a>
+</p>
+
 </div>
 
 ---
@@ -258,12 +265,25 @@ toolz-downloadz-api/
 
 ---
 
-## ⚖️ Legal
+## ⚖️ Legal & Copyright Disclaimers
 
-Only download content you own or have the right to save. Respect TikTok, Instagram, and YouTube Terms of Service and creators' rights. This project is **not affiliated** with TikTok, Meta, Google, Vercel, or tikwm.
+1. **Intended Use & Personal Archiving**: This software is provided strictly for educational, technical, and personal archival purposes of content that the user owns or has the legal right to download under applicable fair use or private copying exceptions.
+2. **No DRM Circumvention**: This API does not defeat, circumvent, or decrypt Digital Rights Management (DRM) mechanisms (such as Widevine, PlayReady, or FairPlay). It accesses only publicly accessible, unencrypted streaming endpoints.
+3. **No Hosting or Storage**: This API does not host, store, index, or distribute copyright-protected video, audio, or image files. Media streams are handled transiently.
+4. **Trademarks & Non-Affiliation**: *TikTok*, *ByteDance*, *Instagram*, *Meta*, *YouTube*, *Google*, and *Vercel* are trademarks of their respective owners. This project is independent and not affiliated with, sponsored by, or endorsed by any of those organizations.
+5. **User Responsibility**: Users of this software are solely responsible for ensuring that their usage complies with all applicable local, national, and international laws, as well as the terms of service of third-party platforms.
+
+---
+
+## 📄 License & Community
+
+Licensed under the **GNU General Public License v3.0** — see [`LICENSE`](LICENSE) for full details.
+
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Contributing Guidelines](CONTRIBUTING.md)
+- [Security Policy](SECURITY.md)
+- [Accessibility Statement](ACCESSIBILITY.md)
 
 <div align="center">
-
-Licensed under [GPL-3.0](LICENSE)
-
+  <sub>Part of the <a href="https://github.com/freroxx/toolz"><strong>Toolz Suite</strong></a> · Built with ❤️ by <a href="https://github.com/freroxx">freroxx</a></sub>
 </div>
