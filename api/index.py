@@ -27,7 +27,8 @@ from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse, HTMLResponse
+from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -1222,6 +1223,8 @@ app = FastAPI(
     title="toolz-downloadz-api",
     description="Media extraction for TikTok and Instagram",
     version=VERSION,
+    docs_url=None,
+    redoc_url=None,
 )
 
 app.add_middleware(
@@ -1256,6 +1259,44 @@ async def health():
 @app.get("/")
 async def root():
     return {"name": "toolz-downloadz-api", "version": VERSION, "docs": "/docs", "health": "/api/health"}
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui_html():
+    """
+    Custom Swagger UI with Vercel Web Analytics integration.
+    Injects analytics script to track developer interactions with API docs.
+    """
+    html = get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
+        swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
+    )
+    # Inject Vercel Web Analytics script before closing </head> tag
+    analytics_script = '<script defer src="/_vercel/insights/script.js"></script>'
+    html_content = html.body.decode("utf-8")
+    html_content = html_content.replace("</head>", f"{analytics_script}</head>")
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/redoc", include_in_schema=False)
+async def custom_redoc_html():
+    """
+    Custom ReDoc with Vercel Web Analytics integration.
+    Injects analytics script to track developer interactions with API docs.
+    """
+    html = get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - ReDoc",
+        redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
+    )
+    # Inject Vercel Web Analytics script before closing </head> tag
+    analytics_script = '<script defer src="/_vercel/insights/script.js"></script>'
+    html_content = html.body.decode("utf-8")
+    html_content = html_content.replace("</head>", f"{analytics_script}</head>")
+    return HTMLResponse(content=html_content)
 
 
 @app.get("/api/platforms")
