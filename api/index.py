@@ -1274,8 +1274,14 @@ async def custom_swagger_ui_html():
         swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
         swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
     )
-    # Inject Vercel Web Analytics script before closing </head> tag
-    analytics_script = '<script defer src="/_vercel/insights/script.js"></script>'
+    # Inject Vercel Web Analytics scripts before closing </head> tag
+    # Following the official Vercel documentation for HTML/vanilla JS implementation:
+    # https://vercel.com/docs/analytics/quickstart
+    analytics_script = '''
+<script>
+  window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+</script>
+<script defer src="/_vercel/insights/script.js"></script>'''
     html_content = html.body.decode("utf-8")
     html_content = html_content.replace("</head>", f"{analytics_script}</head>")
     return HTMLResponse(content=html_content)
@@ -1292,8 +1298,14 @@ async def custom_redoc_html():
         title=f"{app.title} - ReDoc",
         redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@next/bundles/redoc.standalone.js",
     )
-    # Inject Vercel Web Analytics script before closing </head> tag
-    analytics_script = '<script defer src="/_vercel/insights/script.js"></script>'
+    # Inject Vercel Web Analytics scripts before closing </head> tag
+    # Following the official Vercel documentation for HTML/vanilla JS implementation:
+    # https://vercel.com/docs/analytics/quickstart
+    analytics_script = '''
+<script>
+  window.va = window.va || function () { (window.vaq = window.vaq || []).push(arguments); };
+</script>
+<script defer src="/_vercel/insights/script.js"></script>'''
     html_content = html.body.decode("utf-8")
     html_content = html_content.replace("</head>", f"{analytics_script}</head>")
     return HTMLResponse(content=html_content)
