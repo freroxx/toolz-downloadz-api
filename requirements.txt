@@ -1,5 +1,16 @@
-# toolz-downloadz-api v4 — minimal modern deps (TikTok + Instagram only)
-fastapi>=0.115.0
-uvicorn>=0.30.0
-yt-dlp>=2025.6.9
-python-dotenv>=1.0.1
+# toolz-downloadz-api — runtime dependencies (Vercel installs these on every deploy).
+# Checked against PyPI in Nov 2026. Floors are deliberate: pip/uv resolve the newest release at
+# or above them, so a redeploy always picks up upstream fixes.
+#
+# Vercel Python runtime: 3.12 (default), 3.13, 3.14  ->  add a `.python-version` file containing 3.13.
+
+fastapi>=0.162.2,<1.0          # pulls in compatible starlette + pydantic
+httpx>=0.28.1,<1.0             # pooled async client (Redis, tikwm, CDN streaming)
+
+# yt-dlp breaks whenever TikTok/Instagram/YouTube change something — it ships fixes almost weekly.
+# NEVER pin it exactly; redeploy on a schedule to pick up new releases.
+# [default] = certifi, brotli, websockets, requests, urllib3, mutagen, pycryptodomex, yt-dlp-ejs.
+yt-dlp[default]>=2026.7.1
+
+imageio-ffmpeg>=0.6.0          # static ffmpeg binary, only used to merge split video+audio tracks
+python-dotenv>=1.0.1           # local dev only (.env); optional at runtime
